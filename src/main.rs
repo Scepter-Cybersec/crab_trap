@@ -1,91 +1,49 @@
-use std::{collections::HashMap};
+use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::menu::menu_list;
 use crate::socket::{connection, listener};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use tokio::sync::{mpsc, Mutex, MutexGuard};
+use tokio::sync::{mpsc, Mutex};
 
+mod menu;
 mod socket;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    let bound_addr: String;
+    let bound_port: u16;
+    if args.len() == 3 {
+        bound_addr = args[1].clone();
+        bound_port = match args[2].parse::<u16>() {
+            Ok(val) => val,
+            Err(_) => {
+                println!("[-] Invalid port {}", args[2]);
+                println!("Usage: {0} OR {0} <address> <port>", args[0]);
+                return;
+            }
+        };
+    } else if args.len() == 1 {
+        bound_addr = String::from("0.0.0.0");
+        bound_port = 4545;
+    } else {
+        println!("Usage: {0} OR {0} <address> <port>", args[0]);
+        return;
+    }
     let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-   
-    let mut menu: HashMap<
-        String,
-        Box<dyn Fn(MutexGuard<HashMap<String, connection::Handle>>, Option<String>) + Send + Sync + 'static>,
-    > = HashMap::new();
 
-    let list = |connected_shells: MutexGuard<HashMap<String, connection::Handle>>, _: Option<String>| {
-        let shells = connected_shells.clone();
-        for (key, _) in shells.into_iter() {
-            println!("{}", key);
-        }
-    };
-    menu.insert(String::from("l"), Box::new(list));
-
-    let start = |connected_shells: MutexGuard<HashMap<String, connection::Handle>>,
-                 key_opt: Option<String>| {
-        if key_opt.is_some() {
-            let key = key_opt.unwrap();
-            let handle = match connected_shells.get(&key) {
-                Some(val) => val,
-                None => {
-                    println!("Invalid session key!");
-                    return;
-                }
-            };
-
-            //start handler
-            handle.egress.send("start").unwrap();
-        } else {
-            println!("Please provide a session key");
-        }
-    };
-
-    menu.insert(String::from("s"), Box::new(start));
-
-    let delete = |mut connected_shells: MutexGuard<HashMap<String, connection::Handle>>,
-                 key_opt: Option<String>| {
-        if key_opt.is_some() {
-            let key = key_opt.unwrap();
-            let handle = match connected_shells.get(&key) {
-                Some(val) => val,
-                None => {
-                    println!("Invalid session key!");
-                    return;
-                }
-            };
-
-            //delete handler
-            handle.egress.send("delete").unwrap();
-            match connected_shells.remove(&key){
-                Some(val)=> val.soc_kill_sig_send.send(true).unwrap(),
-                None => return
-            };
-        } else {
-            println!("Please provide a session key");
-        }
-    };
-
-    menu.insert(String::from("d"), Box::new(delete));
-
-    let help = |_: MutexGuard<HashMap<String, connection::Handle>>, _: Option<String>| {
-        println!("l - list the connected shells");
-        println!("h - display this help message");
-        println!("s <id> - start iteration with the specified reverse shell");
-        println!("d <id> - remove the specified reverse shell");
-    };
-    menu.insert(String::from("h"), Box::new(help.clone()));
+    let menu = menu_list::new();
 
     // start main input listener
     let connected_shells_menu = connected_shells.clone();
     tokio::spawn(async move {
         let mut stdout = io::stdout();
-
+        menu_list::help();
         loop {
             stdout.write_all("crab_trap 🦀# ".as_bytes()).await.unwrap();
             stdout.flush().await.unwrap();
@@ -111,16 +69,16 @@ async fn main() {
                 let handle: Option<connection::Handle>;
                 {
                     let shells = connected_shells_menu.lock().await;
-                    handle = match shells.get(&menu_arg.clone().unwrap_or(String::new())){
+                    handle = match shells.get(&menu_arg.clone().unwrap_or(String::new())) {
                         Some(val) => Some(val.clone()),
-                        None => None
+                        None => None,
                     };
                     match menu_entry {
                         Some(f) => f(shells, menu_arg),
-                        None => help(shells, None),
+                        None => menu_list::help(),
                     };
                 }
-                
+
                 if map_key.eq("s") && handle.is_some() {
                     loop {
                         let handle_clone = handle.clone();
@@ -135,7 +93,7 @@ async fn main() {
         }
     });
 
-    let socket_stream = listener::catch_sockets(String::from("127.0.0.1"), 8080);
+    let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
 
     let connected_shells_socket = connected_shells.clone();
@@ -144,7 +102,8 @@ async fn main() {
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
         let (soc_to_handle_send, mut soc_to_handle_recv) = mpsc::channel::<String>(1024);
 
-        let (handle, handle_ingress_sender, handle_egress_receiver, soc_kill_sig_recv) = connection::Handle::new();
+        let (handle, handle_ingress_sender, handle_egress_receiver, soc_kill_sig_recv) =
+            connection::Handle::new();
         {
             let mut shells = connected_shells_socket.lock().await;
             match &soc.peer_addr() {
@@ -155,8 +114,12 @@ async fn main() {
             }
         }
 
-        
-        listener::start_socket(soc, soc_to_handle_send, handle_to_soc_recv, soc_kill_sig_recv);
+        listener::start_socket(
+            soc,
+            soc_to_handle_send,
+            handle_to_soc_recv,
+            soc_kill_sig_recv,
+        );
 
         let mut handle_egress_receiver_1 = handle_egress_receiver.clone();
 
@@ -179,7 +142,6 @@ async fn main() {
                     Err(_) => continue,
                 };
                 if content.trim_end().eq("quit") {
-
                     handle_ingress_sender.send("pause").await.unwrap();
                     // send a new line so we get a prompt when we return
                     content = String::from("\n");
@@ -217,7 +179,7 @@ async fn main() {
                     None => String::from(""),
                 };
 
-                let changed = match handle_egress_receiver_2.has_changed(){
+                let changed = match handle_egress_receiver_2.has_changed() {
                     Ok(val) => val,
                     Err(_) => return,
                 };

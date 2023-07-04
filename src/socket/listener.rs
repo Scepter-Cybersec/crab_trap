@@ -6,8 +6,8 @@ use tokio::sync::watch::Receiver as WatchReceiver;
 
 use async_stream::try_stream;
 use futures_core::stream::Stream;
-use tokio::sync::broadcast::Receiver as SocKillReceiver;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
 pub fn catch_sockets(addr: String, port: u16) -> impl Stream<Item = io::Result<TcpStream>> {
     try_stream! {
@@ -39,17 +39,12 @@ pub fn start_socket(
     socket: TcpStream,
     controller_sender: Sender<String>,
     mut controller_receiver: Receiver<String>,
-    mut soc_kill_sig_recv: SocKillReceiver<bool>,
+    soc_kill_token: CancellationToken,
 ) {
     let (mut read_soc, mut write_soc) = socket.into_split();
-    let mut soc_kill_sig_recv_clone = soc_kill_sig_recv.resubscribe();
-    tokio::spawn(async move {
+    let read_handle = tokio::spawn(async move {
         // In a loop, read data from the socket and write the data back.
         loop {
-            let kill_soc = soc_kill_sig_recv.try_recv().unwrap_or(false);
-            if kill_soc {
-                return;
-            }
             match controller_receiver.recv().await {
                 Some(val) => {
                     write_soc.write_all(val.as_bytes()).await.unwrap();
@@ -59,12 +54,8 @@ pub fn start_socket(
             }
         }
     });
-    tokio::spawn(async move {
+    let write_handle = tokio::spawn(async move {
         loop {
-            let kill_soc = soc_kill_sig_recv_clone.try_recv().unwrap_or(false);
-            if kill_soc {
-                return;
-            }
             let mut buf = [0; 1024];
             let n = match read_soc.read(&mut buf).await {
                 // socket closed
@@ -82,5 +73,11 @@ pub fn start_socket(
                 return;
             }
         }
+    });
+
+    tokio::spawn(async move {
+        soc_kill_token.cancelled().await;
+        read_handle.abort();
+        write_handle.abort();
     });
 }
