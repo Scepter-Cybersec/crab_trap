@@ -9,9 +9,64 @@ use crate::socket::{connection, listener};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use tokio::sync::{mpsc, Mutex};
+use sha256::{digest};
 
 mod menu;
 mod socket;
+
+fn input_loop(connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList){
+    tokio::spawn(async move {
+        let mut stdout = io::stdout();
+        menu_list::help();
+        loop {
+            stdout.write_all("crab_trap 🦀# ".as_bytes()).await.unwrap();
+            stdout.flush().await.unwrap();
+            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut buffer = Vec::new();
+            reader.read_until(b'\n', &mut buffer).await.unwrap();
+            let content = match String::from_utf8(buffer) {
+                Ok(val) => val,
+                Err(_) => continue,
+            };
+            let clean_content = String::from(content.trim_end());
+            let args = clean_content.split(" ").collect::<Vec<&str>>();
+
+            let map_key = args[0];
+            let menu_arg: Option<Vec<&str>>;
+            if args.len() > 1 {
+                menu_arg = Some(args[1..].to_vec());
+            } else {
+                menu_arg = None;
+            }
+            if !map_key.eq(&String::new()) {
+                let menu_entry = menu.get(map_key);
+                let handle: Option<connection::Handle>;
+                {
+                    let shells = connected_shells.lock().await;
+                    handle = match shells.get(menu_arg.clone().unwrap_or(vec![""])[0]) {
+                        Some(val) => Some(val.clone()),
+                        None => None,
+                    };
+                    match menu_entry {
+                        Some(f) => f(shells, menu_arg),
+                        None => menu_list::help(),
+                    };
+                }
+
+                if map_key.eq("s") && handle.is_some() {
+                    loop {
+                        let handle_clone = handle.clone();
+                        match handle_clone.unwrap().ingress.lock().await.recv().await {
+                            Some("pause") => break,
+                            Some(_) => continue,
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 #[tokio::main]
 async fn main() {
@@ -41,57 +96,9 @@ async fn main() {
 
     // start main input listener
     let connected_shells_menu = connected_shells.clone();
-    tokio::spawn(async move {
-        let mut stdout = io::stdout();
-        menu_list::help();
-        loop {
-            stdout.write_all("crab_trap 🦀# ".as_bytes()).await.unwrap();
-            stdout.flush().await.unwrap();
-            let mut reader = BufReader::new(tokio::io::stdin());
-            let mut buffer = Vec::new();
-            reader.read_until(b'\n', &mut buffer).await.unwrap();
-            let content = match String::from_utf8(buffer) {
-                Ok(val) => val,
-                Err(_) => continue,
-            };
-            let clean_content = String::from(content.trim_end());
-            let args = clean_content.split(" ").collect::<Vec<&str>>();
-
-            let map_key = String::from(args[0]);
-            let menu_arg: Option<String>;
-            if args.len() > 1 {
-                menu_arg = Some(String::from(args[1]));
-            } else {
-                menu_arg = None;
-            }
-            if !map_key.eq(&String::new()) {
-                let menu_entry = menu.get(&map_key);
-                let handle: Option<connection::Handle>;
-                {
-                    let shells = connected_shells_menu.lock().await;
-                    handle = match shells.get(&menu_arg.clone().unwrap_or(String::new())) {
-                        Some(val) => Some(val.clone()),
-                        None => None,
-                    };
-                    match menu_entry {
-                        Some(f) => f(shells, menu_arg),
-                        None => menu_list::help(),
-                    };
-                }
-
-                if map_key.eq("s") && handle.is_some() {
-                    loop {
-                        let handle_clone = handle.clone();
-                        match handle_clone.unwrap().ingress.lock().await.recv().await {
-                            Some("pause") => break,
-                            Some(_) => continue,
-                            None => continue,
-                        }
-                    }
-                }
-            }
-        }
-    });
+    
+    // get user input
+    input_loop(connected_shells_menu, menu);
 
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
@@ -106,9 +113,11 @@ async fn main() {
             connection::Handle::new();
         {
             let mut shells = connected_shells_socket.lock().await;
+            let soc_key: String;
             match &soc.peer_addr() {
                 Ok(val) => {
-                    shells.insert(val.to_string(), handle);
+                    soc_key = digest(val.to_string())[0..31].to_string();
+                    shells.insert(soc_key, handle);
                 }
                 Err(_) => continue,
             }
@@ -168,7 +177,6 @@ async fn main() {
             {
                 return;
             };
-            println!("reader started");
 
             let mut stdout = io::stdout();
             loop {
