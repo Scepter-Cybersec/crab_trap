@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
+use menu::menu_list::clear;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::menu::menu_list;
@@ -10,6 +11,7 @@ use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use tokio::sync::{mpsc, Mutex};
 use sha256::{digest};
+use termion::{self, color, cursor};
 
 mod menu;
 mod socket;
@@ -17,9 +19,17 @@ mod socket;
 fn input_loop(connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList){
     tokio::spawn(async move {
         let mut stdout = io::stdout();
+        clear();
+        let (_, height) = termion::terminal_size().unwrap();
+        let msg_start = height - (menu.len() as u16);
+        stdout.write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes()).await.unwrap();
+        stdout.flush().await.unwrap();
         menu_list::help();
         loop {
-            stdout.write_all("crab_trap 🦀# ".as_bytes()).await.unwrap();
+            let (_, height) = termion::terminal_size().unwrap();
+
+            let prompt = format!("{bottom}{red}crab_trap 🦀#{reset} ",bottom = cursor::Goto(0,height), red = color::Fg(color::LightRed), reset = color::Fg(color::Reset));
+            stdout.write_all(prompt.as_bytes()).await.unwrap();
             stdout.flush().await.unwrap();
             let mut reader = BufReader::new(tokio::io::stdin());
             let mut buffer = Vec::new();
