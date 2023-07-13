@@ -16,7 +16,7 @@ use termion::{self, color, cursor};
 mod menu;
 mod socket;
 
-fn input_loop(connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList){
+fn input_loop(shells:  Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList, mut menu_channel_acquire: mpsc::Receiver<bool>, menu_channel_release: mpsc::Sender<bool>){
     tokio::spawn(async move {
         let mut stdout = io::stdout();
         clear();
@@ -38,38 +38,24 @@ fn input_loop(connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
                 Ok(val) => val,
                 Err(_) => continue,
             };
-            let clean_content = String::from(content.trim_end());
-            let args = clean_content.split(" ").collect::<Vec<&str>>();
+            let key = String::from(content.trim_end());
 
-            let map_key = args[0];
-            let menu_arg: Option<Vec<&str>>;
-            if args.len() > 1 {
-                menu_arg = Some(args[1..].to_vec());
-            } else {
-                menu_arg = None;
+            let entry = match menu.get(&*key) {
+                Some(val) => val,
+                None => continue
+            };
+
+            {
+                let locked_shells = shells.lock().await;
+                entry(locked_shells, menu_channel_release.clone())
             }
-            if !map_key.eq(&String::new()) {
-                let menu_entry = menu.get(map_key);
-                let handle: Option<connection::Handle>;
-                {
-                    let shells = connected_shells.lock().await;
-                    handle = match shells.get(menu_arg.clone().unwrap_or(vec![""])[0]) {
-                        Some(val) => Some(val.clone()),
-                        None => None,
-                    };
-                    match menu_entry {
-                        Some(f) => f(shells, menu_arg),
-                        None => menu_list::help(),
-                    };
-                }
 
-                if map_key.eq("s") && handle.is_some() {
+            if !key.eq(&String::new()) {
+                if key.eq("l") {
                     loop {
-                        let handle_clone = handle.clone();
-                        match handle_clone.unwrap().ingress.lock().await.recv().await {
-                            Some("pause") => break,
-                            Some(_) => continue,
-                            None => continue,
+                        match menu_channel_acquire.recv().await.unwrap_or(true){
+                            true => break,
+                            false => continue
                         }
                     }
                 }
@@ -101,14 +87,11 @@ async fn main() {
         return;
     }
     let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-
+    let (menu_channel_release, menu_channel_acquire) = mpsc::channel::<bool>(1024);
     let menu = menu_list::new();
-
-    // start main input listener
-    let connected_shells_menu = connected_shells.clone();
     
     // get user input
-    input_loop(connected_shells_menu, menu);
+    input_loop(connected_shells.clone(), menu, menu_channel_acquire, menu_channel_release.clone());
 
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
@@ -141,7 +124,7 @@ async fn main() {
         );
 
         let mut handle_egress_receiver_1 = handle_egress_receiver.clone();
-
+        let menu_channel_release_1 = menu_channel_release.clone();
         // start writer
         tokio::spawn(async move {
             // wait for start signal
@@ -162,6 +145,8 @@ async fn main() {
                 };
                 if content.trim_end().eq("quit") {
                     handle_ingress_sender.send("pause").await.unwrap();
+                    menu_channel_release_1.send(true).await.unwrap();
+
                     // send a new line so we get a prompt when we return
                     content = String::from("\n");
                     if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
