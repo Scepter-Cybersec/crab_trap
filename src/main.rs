@@ -9,26 +9,39 @@ use crate::menu::menu_list;
 use crate::socket::{connection, listener};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use tokio::sync::{mpsc, Mutex};
-use sha256::{digest};
+use sha256::digest;
 use termion::{self, color, cursor};
+use tokio::sync::{mpsc, Mutex};
 
 mod menu;
 mod socket;
 
-fn input_loop(shells:  Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList, mut menu_channel_acquire: mpsc::Receiver<bool>, menu_channel_release: mpsc::Sender<bool>){
+fn input_loop(
+    shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
+    menu: menu_list::MenuList,
+    mut menu_channel_acquire: mpsc::Receiver<()>,
+    menu_channel_release: mpsc::Sender<()>,
+) {
     tokio::spawn(async move {
         let mut stdout = io::stdout();
         clear();
         let (_, height) = termion::terminal_size().unwrap();
         let msg_start = height - (menu.len() as u16);
-        stdout.write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes()).await.unwrap();
+        stdout
+            .write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes())
+            .await
+            .unwrap();
         stdout.flush().await.unwrap();
         menu_list::help();
         loop {
             let (_, height) = termion::terminal_size().unwrap();
 
-            let prompt = format!("{bottom}{red}crab_trap 🦀#{reset} ",bottom = cursor::Goto(0,height), red = color::Fg(color::LightRed), reset = color::Fg(color::Reset));
+            let prompt = format!(
+                "{bottom}{red}crab_trap 🦀#{reset} ",
+                bottom = cursor::Goto(0, height),
+                red = color::Fg(color::LightRed),
+                reset = color::Fg(color::Reset)
+            );
             stdout.write_all(prompt.as_bytes()).await.unwrap();
             stdout.flush().await.unwrap();
             let mut reader = BufReader::new(tokio::io::stdin());
@@ -42,7 +55,7 @@ fn input_loop(shells:  Arc<Mutex<HashMap<String, connection::Handle>>>, menu: me
 
             let entry = match menu.get(&*key) {
                 Some(val) => val,
-                None => continue
+                None => continue,
             };
 
             {
@@ -52,12 +65,7 @@ fn input_loop(shells:  Arc<Mutex<HashMap<String, connection::Handle>>>, menu: me
 
             if !key.eq(&String::new()) {
                 if key.eq("l") {
-                    loop {
-                        match menu_channel_acquire.recv().await.unwrap_or(true){
-                            true => break,
-                            false => continue
-                        }
-                    }
+                    menu_channel_acquire.recv().await.unwrap();
                 }
             }
         }
@@ -87,11 +95,16 @@ async fn main() {
         return;
     }
     let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-    let (menu_channel_release, menu_channel_acquire) = mpsc::channel::<bool>(1024);
+    let (menu_channel_release, menu_channel_acquire) = mpsc::channel::<()>(1024);
     let menu = menu_list::new();
-    
+
     // get user input
-    input_loop(connected_shells.clone(), menu, menu_channel_acquire, menu_channel_release.clone());
+    input_loop(
+        connected_shells.clone(),
+        menu,
+        menu_channel_acquire,
+        menu_channel_release.clone(),
+    );
 
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
@@ -145,7 +158,7 @@ async fn main() {
                 };
                 if content.trim_end().eq("quit") {
                     handle_ingress_sender.send("pause").await.unwrap();
-                    menu_channel_release_1.send(true).await.unwrap();
+                    menu_channel_release_1.send(()).await.unwrap();
 
                     // send a new line so we get a prompt when we return
                     content = String::from("\n");
