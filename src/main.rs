@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use menu::menu_list::clear;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 use crate::menu::menu_list;
 use crate::socket::{connection, listener};
@@ -59,8 +62,7 @@ fn input_loop(
             };
 
             {
-                let locked_shells = shells.lock().await;
-                entry(locked_shells, menu_channel_release.clone())
+                entry(shells.clone(), menu_channel_release.clone())
             }
 
             if !key.eq(&String::new()) {
@@ -70,6 +72,26 @@ fn input_loop(
             }
         }
     });
+}
+
+async fn soc_is_shell(soc: &mut TcpStream, soc_key: String) -> bool {
+    soc.write(format!("echo {}\r\n", soc_key).as_bytes())
+        .await
+        .unwrap();
+    let mut buf: [u8; 4096] = [0; 4096];
+    for _ in 0..10 {
+        let len = soc.try_read(&mut buf);
+        if len.is_ok() {
+            let content: String = String::from_utf8_lossy(&buf[..len.unwrap()]).into();
+            if content.contains(&soc_key) {
+                // add a new line so we get our prompt back
+                soc.write("\n".as_bytes()).await.unwrap();
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    return false;
 }
 
 #[tokio::main]
@@ -111,107 +133,43 @@ async fn main() {
 
     let connected_shells_socket = connected_shells.clone();
     loop {
-        let soc = socket_stream.next().await.unwrap().unwrap();
+        let mut soc = socket_stream.next().await.unwrap().unwrap();
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
-        let (soc_to_handle_send, mut soc_to_handle_recv) = mpsc::channel::<String>(1024);
+        let (soc_to_handle_send, soc_to_handle_recv) = mpsc::channel::<String>(1024);
 
         let (handle, handle_ingress_sender, handle_egress_receiver, soc_kill_sig_recv) =
             connection::Handle::new();
-        {
-            let mut shells = connected_shells_socket.lock().await;
+        let connected_shells_copy = connected_shells_socket.clone();
+
+        let menu_release_copy = menu_channel_release.clone();
+        tokio::spawn(async move {
             let soc_key: String;
             match &soc.peer_addr() {
                 Ok(val) => {
                     soc_key = digest(val.to_string())[0..31].to_string();
-                    shells.insert(soc_key, handle);
-                }
-                Err(_) => continue,
-            }
-        }
 
-        listener::start_socket(
-            soc,
-            soc_to_handle_send,
-            handle_to_soc_recv,
-            soc_kill_sig_recv,
-        );
-
-        let mut handle_egress_receiver_1 = handle_egress_receiver.clone();
-        let menu_channel_release_1 = menu_channel_release.clone();
-        // start writer
-        tokio::spawn(async move {
-            // wait for start signal
-            if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            loop {
-                let mut reader = BufReader::new(tokio::io::stdin());
-                let mut buffer = Vec::new();
-                reader.read_until(b'\n', &mut buffer).await.unwrap();
-                let mut content = match String::from_utf8(buffer) {
-                    Ok(val) => val,
-                    Err(_) => continue,
-                };
-                if content.trim_end().eq("quit") {
-                    handle_ingress_sender.send("pause").await.unwrap();
-                    menu_channel_release_1.send(()).await.unwrap();
-
-                    // send a new line so we get a prompt when we return
-                    content = String::from("\n");
-                    if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-                        .await
-                        .is_err()
-                    {
+                    let is_shell = soc_is_shell(&mut soc, soc_key.clone()).await;
+                    if is_shell {
+                        let mut shells = connected_shells_copy.lock().await;
+                        shells.insert(soc_key, handle.clone());
+                        listener::start_socket(
+                            soc,
+                            soc_to_handle_send,
+                            handle_to_soc_recv,
+                            soc_kill_sig_recv,
+                        );
+                        connection::handle_listen(
+                            handle_ingress_sender,
+                            handle_egress_receiver,
+                            handle_to_soc_send,
+                            soc_to_handle_recv,
+                            menu_release_copy,
+                        );
+                    } else {
                         return;
                     }
                 }
-                if handle_to_soc_send.send(content).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        // start reader
-        let mut handle_egress_receiver_2 = handle_egress_receiver;
-        tokio::spawn(async move {
-            // wait for start signal
-            if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-                .await
-                .is_err()
-            {
-                return;
-            };
-
-            let mut stdout = io::stdout();
-            loop {
-                stdout.flush().await.unwrap();
-
-                let resp = match soc_to_handle_recv.recv().await {
-                    Some(val) => val,
-                    None => String::from(""),
-                };
-
-                let changed = match handle_egress_receiver_2.has_changed() {
-                    Ok(val) => val,
-                    Err(_) => return,
-                };
-                if changed {
-                    let val = *handle_egress_receiver_2.borrow();
-                    if val.eq("pause") {
-                        if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        };
-                        continue;
-                    }
-                }
-                stdout.write_all(resp.as_bytes()).await.unwrap();
+                Err(_) => return,
             }
         });
     }

@@ -42,7 +42,7 @@ pub fn start_socket(
     soc_kill_token: CancellationToken,
 ) {
     let (mut read_soc, mut write_soc) = socket.into_split();
-    let read_handle = tokio::spawn(async move {
+    let write_handle = tokio::spawn(async move {
         // In a loop, read data from the socket and write the data back.
         loop {
             match controller_receiver.recv().await {
@@ -54,7 +54,7 @@ pub fn start_socket(
             }
         }
     });
-    let write_handle = tokio::spawn(async move {
+    let read_handle = tokio::spawn(async move {
         loop {
             let mut buf = [0; 1024];
             let n = match read_soc.read(&mut buf).await {
@@ -68,7 +68,6 @@ pub fn start_socket(
             };
 
             let send_content = String::from_utf8((&buf[0..n]).to_vec()).unwrap_or_default();
-
             if controller_sender.send(send_content).await.is_err() {
                 return;
             }
