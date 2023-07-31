@@ -2,6 +2,7 @@ use std::io::{Error, ErrorKind};
 
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::watch::Receiver as WatchReceiver;
 
 use async_stream::try_stream;
@@ -42,41 +43,40 @@ pub fn start_socket(
     soc_kill_token: CancellationToken,
 ) {
     let (mut read_soc, mut write_soc) = socket.into_split();
-    let write_handle = tokio::spawn(async move {
-        // In a loop, read data from the socket and write the data back.
-        loop {
-            match controller_receiver.recv().await {
-                Some(val) => {
-                    write_soc.write_all(val.as_bytes()).await.unwrap();
-                    write_soc.flush().await.unwrap();
-                }
-                None => return,
-            }
-        }
-    });
-    let read_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         loop {
             let mut buf = [0; 1024];
-            let n = match read_soc.read(&mut buf).await {
-                // socket closed
-                Ok(n) if n == 0 => return,
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("failed to read from socket; err = {:?}", e);
+            select! {
+                item = controller_receiver.recv() => {
+                    match item {
+                        Some(val) => {
+                            if write_soc.write_all(val.as_bytes()).await.is_err(){
+                                return;
+                            }
+                            write_soc.flush().await.unwrap();
+                        }
+                        None => return,
+                    };
+                }
+                item = read_soc.read(&mut buf) => {
+                    let n = match item {
+                        // socket closed
+                        Ok(n) if n == 0 => return,
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("failed to read from socket; err = {:?}", e);
+                            return;
+                        }
+                    };
+                    let send_content = String::from_utf8((&buf[0..n]).to_vec()).unwrap_or_default();
+                    if controller_sender.send(send_content).await.is_err() {
+                        return;
+                    }
+                }
+                _ = soc_kill_token.cancelled() => {
                     return;
                 }
-            };
-
-            let send_content = String::from_utf8((&buf[0..n]).to_vec()).unwrap_or_default();
-            if controller_sender.send(send_content).await.is_err() {
-                return;
             }
         }
-    });
-
-    tokio::spawn(async move {
-        soc_kill_token.cancelled().await;
-        read_handle.abort();
-        write_handle.abort();
     });
 }

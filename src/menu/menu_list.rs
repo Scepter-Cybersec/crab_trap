@@ -1,4 +1,4 @@
-use std::cmp::max;
+use std::cmp::{max};
 use std::collections::HashMap;
 
 use std::io::{stdin, stdout, Stdout, Write};
@@ -7,7 +7,7 @@ use termion::cursor::DetectCursorPos;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
-use termion::{clear, color, cursor};
+use termion::{clear, color, cursor, terminal_size};
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 
 use crate::socket::connection;
@@ -31,7 +31,7 @@ pub fn clear() {
     println!("{clear}", clear = clear::All);
 }
 
-fn start(key: String, connected_shells: MutexGuard<HashMap<String, connection::Handle>>) {
+fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::Handle>>) {
     let handle = match connected_shells.get(&key) {
         Some(val) => val,
         None => {
@@ -41,10 +41,12 @@ fn start(key: String, connected_shells: MutexGuard<HashMap<String, connection::H
     };
 
     //start handler
+    let mut stdout = stdout();
+    write!(stdout, "\r\n{guide}type \"quit\" to exit shell{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
     handle.egress.send("start").unwrap();
 }
 
-fn delete(key: String, mut connected_shells: MutexGuard<HashMap<String, connection::Handle>>) {
+fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>) {
     let handle = match connected_shells.remove(&key) {
         Some(val) => val,
         None => {
@@ -60,7 +62,7 @@ fn delete(key: String, mut connected_shells: MutexGuard<HashMap<String, connecti
 fn alias(
     shell_key: String,
     selected_index: u16,
-    mut connected_shells: MutexGuard<HashMap<String, connection::Handle>>,
+    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>,
 ) {
     let mut stdout = stdout();
     macro_rules! reset_alias_line {
@@ -141,10 +143,17 @@ macro_rules! unlock_menu {
     };
 }
 
-// fn list_menu_help(
-//     stdout: &mut RawTerminal<Stdout>,
-//     println!()
-// ){}
+fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
+    let (width, start_pos) = terminal_size().unwrap();
+    let mut msg = String::from("(ENTER - start shell) (DEL | BACK - remove shell) (ESC - back to menu) (a - rename shell)");
+    if msg.len() > width.into(){
+        let split = max(width-3, 0).into();
+        msg = String::from(&msg.as_str()[..split]);
+        msg = msg+"...";
+    }
+    write!(stdout, "\r\n{goto}{select}{msg}{reset}", goto = cursor::Goto(0, start_pos), msg = msg, select = color::Bg(color::LightBlack), reset = color::Bg(color::Reset)).unwrap();
+    stdout.flush().unwrap();
+}
 
 fn refresh_list_display(
     stdout: &mut RawTerminal<Stdout>,
@@ -166,7 +175,7 @@ fn refresh_list_display(
             selection = format!(
                 "{select}{key}{reset}{hide}",
                 key = key,
-                select = color::Bg(color::LightRed),
+                select = color::Bg(color::Red),
                 hide = cursor::Hide,
                 reset = color::Bg(color::Reset),
             );
@@ -179,7 +188,7 @@ fn refresh_list_display(
         }
         stdout.flush().unwrap();
     }
-    // select_item!(stdout, cur_idx, keys, true);
+    list_menu_help(stdout);
 }
 
 pub fn new() -> MenuList {
@@ -207,8 +216,8 @@ pub fn new() -> MenuList {
                 keys = init_keys;
                 refresh_list_display(&mut stdout, start_pos, cur_idx, keys.to_owned());
 
-                let mut line_offset: i16 = 1;
-                let mut max_shell_len = keys.len();
+                let mut line_offset: i16 = 0;
+                let mut shells = connected_shells.lock().await;
                 for key in stdin.keys() {
                     {
                         match key.unwrap() {
@@ -228,8 +237,7 @@ pub fn new() -> MenuList {
                             }
                             Key::Char('\n') | Key::Char('\r') => {
                                 let key = keys[cur_idx].to_owned();
-                                let shells = connected_shells.lock().await;
-                                start(key, shells);
+                                start(key, &shells);
                                 println!(
                                     "\r\n{show}{blink}",
                                     show = cursor::Show,
@@ -239,53 +247,37 @@ pub fn new() -> MenuList {
                             }
                             Key::Delete | Key::Backspace => {
                                 let key: String = keys[cur_idx].to_owned();
-                                let shells = connected_shells.lock().await;
-                                delete(key, shells);
+                                delete(key, &mut shells);
+                                line_offset -= 1;
                                 if cur_idx > 0 {
                                     cur_idx -= 1;
                                 }
                                 write!(stdout, "{}", clear::CurrentLine).unwrap();
                                 stdout.flush().unwrap();
 
-                                if connected_shells.lock().await.is_empty() {
+                                if shells.is_empty() {
                                     unlock_menu!(menu_channel_release);
                                     return;
                                 }
                             }
                             Key::Char('a') => {
                                 let key: String = keys[cur_idx].to_owned();
-                                let shells = connected_shells.lock().await;
+
                                 alias(
                                     key,
                                     (((start_pos + cur_idx as u16) as i16 + line_offset)
                                         - (shells.len() as i16))
                                         as u16,
-                                    shells,
+                                    &mut shells,
                                 );
                             }
                             _ => {}
                         }
                     }
-
-                    let shells = connected_shells.lock().await;
-                    let shell_len_change = shells.len() as i16 - keys.len() as i16;
-                    keys = shells.keys().map(|item| item.into()).collect();
-                    let mut new_shells_added: Option<i16> = None;
-                    if keys.len() <= max_shell_len {
-                        line_offset += shell_len_change;
-                    } else {
-                        // need to create a new line in the terminal
-                        new_shells_added = Some(1 + shell_len_change);
-                    }
-                    max_shell_len = max(max_shell_len, keys.len());
+                    keys = shells.keys().map(|item| item.to_owned()).collect();
                     refresh_list_display(
                         &mut stdout,
-                        ((start_pos as i16
-                            + match new_shells_added {
-                                Some(val) => val,
-                                None => line_offset,
-                            })
-                            - (keys.len() as i16)) as u16,
+                        (start_pos as i16 + line_offset) as u16 - shells.len() as u16,
                         cur_idx,
                         keys.to_owned(),
                     );

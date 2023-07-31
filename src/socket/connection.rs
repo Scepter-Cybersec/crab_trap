@@ -1,7 +1,10 @@
 use crate::listener;
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::{self, Receiver as IngressReceiver, Receiver, Sender as IngressSender, Sender};
+use tokio::select;
+use tokio::sync::mpsc::{
+    self, Receiver as IngressReceiver, Receiver, Sender as IngressSender, Sender,
+};
 use tokio::sync::watch::{self, Receiver as EgressReceiver, Sender as EgressSender};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -57,70 +60,45 @@ pub fn handle_listen(
             return;
         }
 
+        let mut reader = BufReader::new(tokio::io::stdin());
         loop {
-            let mut reader = BufReader::new(tokio::io::stdin());
             let mut buffer = Vec::new();
-            reader.read_until(b'\n', &mut buffer).await.unwrap();
-            let mut content = match String::from_utf8(buffer) {
-                Ok(val) => val,
-                Err(_) => continue,
-            };
-            if content.trim_end().eq("quit") {
-                sender.send("pause").await.unwrap();
-                menu_channel_release_1.send(()).await.unwrap();
-
-                // send a new line so we get a prompt when we return
-                content = String::from("\n");
-                if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            if handle_to_soc_send.send(content).await.is_err() {
-                return;
-            }
-        }
-    });
-
-    // start reader
-    let mut handle_egress_receiver_2 = receiver;
-    tokio::spawn(async move {
-        // wait for start signal
-        if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-            .await
-            .is_err()
-        {
-            return;
-        };
-
-        let mut stdout = io::stdout();
-        loop {
-            stdout.flush().await.unwrap();
-
-            let resp = match soc_to_handle_recv.recv().await {
-                Some(val) => val,
-                None => String::from(""),
-            };
-
-            let changed = match handle_egress_receiver_2.has_changed() {
-                Ok(val) => val,
-                Err(_) => return,
-            };
-            if changed {
-                let val = *handle_egress_receiver_2.borrow();
-                if val.eq("pause") {
-                    if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-                        .await
-                        .is_err()
-                    {
-                        return;
+            let input_read_handle = reader.read_until(b'\n', &mut buffer);
+            let soc_read_handle = soc_to_handle_recv.recv();
+            select! {
+                _ = input_read_handle => {
+                    let mut content = match String::from_utf8(buffer) {
+                        Ok(val) => val,
+                        Err(_) => continue,
                     };
-                    continue;
+                    if content.trim_end().eq("quit") {
+                        sender.send("pause").await.unwrap();
+                        menu_channel_release_1.send(()).await.unwrap();
+
+                        // send a new line so we get a prompt when we return
+                        content = String::from("\n");
+                        if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if handle_to_soc_send.send(content).await.is_err() {
+                        return;
+                    }
+                }
+                val = soc_read_handle => {
+
+                    let resp = match val {
+                        Some(item) => item,
+                        None => String::from("")
+                    };
+                    let mut stdout = io::stdout();
+                    stdout.write_all(resp.as_bytes()).await.unwrap();
+                    stdout.flush().await.unwrap();
                 }
             }
-            stdout.write_all(resp.as_bytes()).await.unwrap();
         }
     });
 }
