@@ -1,4 +1,4 @@
-use std::cmp::{max};
+use std::cmp::max;
 use std::collections::HashMap;
 
 use std::io::{stdin, stdout, Stdout, Write};
@@ -43,7 +43,7 @@ fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::
     //start handler
     let mut stdout = stdout();
     write!(stdout, "\r\n{guide}type \"quit\" to exit shell{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
-    handle.egress.send("start").unwrap();
+    handle.tx.send("start").unwrap();
 }
 
 fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>) {
@@ -55,7 +55,7 @@ fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connect
         }
     };
     //delete handler
-    handle.egress.send("delete").unwrap();
+    handle.tx.send("delete").unwrap();
     handle.soc_kill_token.cancel();
 }
 
@@ -159,7 +159,7 @@ fn refresh_list_display(
     stdout: &mut RawTerminal<Stdout>,
     start_pos: u16,
     cur_idx: usize,
-    keys: Vec<String>,
+    keys: Vec<(String, connection::Handle)>,
 ) {
     write!(
         stdout,
@@ -170,17 +170,22 @@ fn refresh_list_display(
     .unwrap();
     stdout.flush().unwrap();
     for (i, key) in keys.clone().into_iter().enumerate() {
+        let raw_mode = match key.1.raw_mode {
+            true => " (raw)",
+            false => ""
+        };
         let selection: String;
         if i == cur_idx {
             selection = format!(
-                "{select}{key}{reset}{hide}",
-                key = key,
+                "{select}{key}{raw}{reset}{hide}",
+                key = key.0,
+                raw = raw_mode,
                 select = color::Bg(color::Red),
                 hide = cursor::Hide,
                 reset = color::Bg(color::Reset),
             );
         } else {
-            selection = format!("{key}{hide}", key = key, hide = cursor::Hide,);
+            selection = format!("{key}{raw}{hide}", key = key.0, raw = raw_mode, hide = cursor::Hide,);
         }
         write!(stdout, "{}", selection).unwrap();
         if i < &keys.len() - 1 {
@@ -199,22 +204,22 @@ pub fn new() -> MenuList {
         tokio::spawn(async move {
             let stdin = stdin();
             let mut stdout = stdout().into_raw_mode().unwrap();
-            let init_keys: Vec<String>;
+            let mut shell_list: Vec<(String, connection::Handle)>;
             {
-                init_keys = connected_shells
+                shell_list = connected_shells
                     .lock()
                     .await
-                    .keys()
-                    .map(|item| item.to_owned())
-                    .collect::<Vec<String>>()
+                    .iter()
+                    .map(|item| (item.0.to_owned(), item.1.to_owned()))
+                    .collect::<Vec<(String, connection::Handle)>>()
             }
-            if init_keys.len() > 0 {
+            if shell_list.len() > 0 {
                 let (_, start_pos) = stdout.cursor_pos().unwrap();
                 let mut cur_idx = 0;
                 let mut keys: Vec<String>;
 
-                keys = init_keys;
-                refresh_list_display(&mut stdout, start_pos, cur_idx, keys.to_owned());
+                keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
+                refresh_list_display(&mut stdout, start_pos, cur_idx, shell_list.to_owned());
 
                 let mut line_offset: i16 = 0;
                 let mut shells = connected_shells.lock().await;
@@ -245,6 +250,16 @@ pub fn new() -> MenuList {
                                 );
                                 return;
                             }
+                            Key::Char('r') => {
+                                // activate raw mode
+                                let key: String = keys[cur_idx].to_owned();
+                                let handle = match shells.get_mut(&key) {
+                                    Some(han) => han,
+                                    None => return
+                                };
+                                handle.raw_mode = !handle.raw_mode;
+                                handle.tx.send("raw").unwrap();
+                            }
                             Key::Delete | Key::Backspace => {
                                 let key: String = keys[cur_idx].to_owned();
                                 delete(key, &mut shells);
@@ -274,12 +289,13 @@ pub fn new() -> MenuList {
                             _ => {}
                         }
                     }
-                    keys = shells.keys().map(|item| item.to_owned()).collect();
+                    shell_list = shells.iter().map(|item| (item.0.to_owned(), item.1.to_owned())).collect();
+                    keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
                     refresh_list_display(
                         &mut stdout,
                         (start_pos as i16 + line_offset) as u16 - shells.len() as u16,
                         cur_idx,
-                        keys.to_owned(),
+                        shell_list,
                     );
                 }
             }
@@ -293,27 +309,6 @@ pub fn new() -> MenuList {
     };
 
     menu.insert("clear", Box::new(clear));
-
-    // let alias = |mut connected_shells: MutexGuard<HashMap<String, connection::Handle>>,
-    //              key_opts: Option<Vec<&str>>| {
-    //     if key_opts.is_some() && key_opts.clone().unwrap().len() > 1 {
-    //         let args = key_opts.unwrap();
-    //         let ses_key = args[0];
-    //         let alias = args[1];
-    //         let handle = match connected_shells.remove(ses_key) {
-    //             Some(val) => val,
-    //             None => {
-    //                 println!("Invalid session key!");
-    //                 return;
-    //             }
-    //         };
-    //         connected_shells.insert(String::from(alias), handle);
-    //     } else {
-    //         println!("Please provide a session key and an alias");
-    //     }
-    // };
-
-    // menu.insert("a", Box::new(alias));
 
     menu.insert("h", Box::new(|_, _| help()));
 

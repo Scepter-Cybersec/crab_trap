@@ -14,7 +14,7 @@ use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use sha256::digest;
 use termion::{self, color, cursor};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, watch};
 
 mod menu;
 mod socket;
@@ -34,7 +34,7 @@ fn input_loop(
             .write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes())
             .await
             .unwrap();
-        stdout.flush().await.unwrap();
+        stdout.flush().await.unwrap_or_default();
         menu_list::help();
         loop {
             let (_, height) = termion::terminal_size().unwrap();
@@ -61,9 +61,7 @@ fn input_loop(
                 None => continue,
             };
 
-            {
-                entry(shells.clone(), menu_channel_release.clone())
-            }
+            entry(shells.clone(), menu_channel_release.clone());
 
             if !key.eq(&String::new()) {
                 if key.eq("l") {
@@ -135,9 +133,9 @@ async fn main() {
     loop {
         let mut soc = socket_stream.next().await.unwrap().unwrap();
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
-        let (soc_to_handle_send, soc_to_handle_recv) = mpsc::channel::<String>(1024);
+        let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
 
-        let (handle, handle_ingress_sender, handle_egress_receiver, soc_kill_sig_recv) =
+        let (handle, _, soc_kill_sig_recv) =
             connection::Handle::new();
         let connected_shells_copy = connected_shells_socket.clone();
 
@@ -151,20 +149,14 @@ async fn main() {
                     let is_shell = soc_is_shell(&mut soc, soc_key.clone()).await;
                     if is_shell {
                         let mut shells = connected_shells_copy.lock().await;
-                        shells.insert(soc_key, handle.clone());
                         listener::start_socket(
                             soc,
                             soc_to_handle_send,
                             handle_to_soc_recv,
                             soc_kill_sig_recv,
                         );
-                        connection::handle_listen(
-                            handle_ingress_sender,
-                            handle_egress_receiver,
-                            handle_to_soc_send,
-                            soc_to_handle_recv,
-                            menu_release_copy,
-                        );
+                        handle.handle_listen(handle_to_soc_send, soc_to_handle_recv, menu_release_copy);
+                        shells.insert(soc_key, handle);
                     } else {
                         return;
                     }

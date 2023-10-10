@@ -1,83 +1,120 @@
+use std::io::{stdin, stdout};
+
 use crate::listener;
-use std::sync::Arc;
+use termion::event::Key;
+use termion::input::TermRead;
+use termion::raw::IntoRawMode;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::select;
-use tokio::sync::mpsc::{
-    self, Receiver as IngressReceiver, Receiver, Sender as IngressSender, Sender,
-};
-use tokio::sync::watch::{self, Receiver as EgressReceiver, Sender as EgressSender};
-use tokio::sync::Mutex;
+use tokio::sync::broadcast::{self, Receiver as HandleReceiver, Sender as HandleSender};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::watch::Receiver;
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct Handle {
-    pub egress: Arc<EgressSender<&'static str>>,
-    pub ingress: Arc<Mutex<IngressReceiver<&'static str>>>,
+    pub tx: HandleSender<&'static str>,
     pub soc_kill_token: CancellationToken,
+    pub raw_mode: bool,
+}
+
+async fn handle_key_input() -> Option<Key> {
+    return match stdin().keys().next() {
+        Some(key) => {
+            return match key {
+                Ok(val) => Some(val),
+                Err(_) => None,
+            };
+        }
+        None => None,
+    };
 }
 
 impl Handle {
-    pub fn new() -> (
-        Handle,
-        IngressSender<&'static str>,
-        EgressReceiver<&'static str>,
-        CancellationToken,
-    ) {
-        let (ingress_sender, ingress_receiver) = mpsc::channel::<&str>(1024);
-        let (egress_sender, egress_receiver) = watch::channel::<&str>("");
+    pub fn new() -> (Handle, HandleReceiver<&'static str>, CancellationToken) {
+        let (tx, rx) = broadcast::channel::<&str>(1024);
         let soc_kill_token = CancellationToken::new();
         let soc_kill_token_listen = soc_kill_token.clone();
         let handle = Handle {
-            egress: Arc::new(egress_sender),
-            ingress: Arc::new(Mutex::new(ingress_receiver)),
+            tx,
             soc_kill_token,
+            raw_mode: false,
         };
-        return (
-            handle,
-            ingress_sender,
-            egress_receiver,
-            soc_kill_token_listen,
-        );
+        return (handle, rx, soc_kill_token_listen);
     }
-}
 
-pub fn handle_listen(
-    sender: IngressSender<&'static str>,
-    receiver: EgressReceiver<&'static str>,
-    handle_to_soc_send: Sender<String>,
-    mut soc_to_handle_recv: Receiver<String>,
-    menu_channel_release: Sender<()>,
-) {
-    let mut handle_egress_receiver_1 = receiver.clone();
-    let menu_channel_release_1 = menu_channel_release.clone();
-    // start writer
-    tokio::spawn(async move {
-        // wait for start signal
-        if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-            .await
-            .is_err()
-        {
-            return;
-        }
+    pub fn handle_listen(
+        &self,
+        handle_to_soc_send: Sender<String>,
+        mut soc_to_handle_recv: Receiver<String>,
+        menu_channel_release: Sender<()>,
+    ) {
+        let menu_channel_release_1 = menu_channel_release.clone();
+        let tx = self.tx.clone();
+        let tx_copy = self.tx.clone();
+        let mut raw_mode = self.raw_mode;
+        // start reader
+        tokio::spawn(async move {
+            let mut active = false;
+            loop {
+                let rx1 = tx_copy.subscribe();
+                let rx2 = tx_copy.subscribe();
+                if !active {
+                    if listener::wait_for_signal(rx1, "start", &mut raw_mode)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    active = true;
+                }
 
-        let mut reader = BufReader::new(tokio::io::stdin());
-        loop {
-            let mut buffer = Vec::new();
-            let input_read_handle = reader.read_until(b'\n', &mut buffer);
-            let soc_read_handle = soc_to_handle_recv.recv();
-            select! {
-                _ = input_read_handle => {
+                // wait for new read content or pause notification
+                select! {
+                    _ = soc_to_handle_recv.changed() =>{
+                        let resp = soc_to_handle_recv.borrow().to_owned();
+                        let mut stdout = io::stdout();
+                        stdout.write_all(resp.as_bytes()).await.unwrap();
+                        stdout.flush().await.unwrap();
+                    }
+                    _ = listener::wait_for_signal(rx2, "quit", &mut raw_mode) =>{
+                        active = false
+                    }
+                }
+            }
+        });
+        // start writer
+        tokio::spawn(async move {
+            // wait for start signal
+            if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let mut reader = BufReader::new(tokio::io::stdin());
+            loop {
+                let stdout = stdout().into_raw_mode().unwrap();
+                if !raw_mode {
+                    stdout.suspend_raw_mode().unwrap();
+                    let mut buffer = Vec::new();
+                    reader
+                        .read_until(b'\n', &mut buffer)
+                        .await
+                        .unwrap_or_default();
                     let mut content = match String::from_utf8(buffer) {
                         Ok(val) => val,
                         Err(_) => continue,
                     };
                     if content.trim_end().eq("quit") {
-                        sender.send("pause").await.unwrap();
+                        //notify the reader that we're pausing
+                        tx.send("quit").unwrap();
                         menu_channel_release_1.send(()).await.unwrap();
-
                         // send a new line so we get a prompt when we return
                         content = String::from("\n");
-                        if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
+                        if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
                             .await
                             .is_err()
                         {
@@ -87,18 +124,41 @@ pub fn handle_listen(
                     if handle_to_soc_send.send(content).await.is_err() {
                         return;
                     }
-                }
-                val = soc_read_handle => {
-
-                    let resp = match val {
-                        Some(item) => item,
-                        None => String::from("")
-                    };
-                    let mut stdout = io::stdout();
-                    stdout.write_all(resp.as_bytes()).await.unwrap();
-                    stdout.flush().await.unwrap();
+                } else {
+                    //need this to avoid deadlock due to std:io reading keys blocking the main thread, TODO: will eventually switch to tokyo
+                    sleep(Duration::from_millis(100)).await;
+                    let inp_val = handle_key_input().await;
+                    if inp_val.is_none() {
+                        continue;
+                    }
+                    let key = inp_val.unwrap();
+                    match key {
+                        Key::Ctrl('x') => {
+                            tx.send("quit").unwrap();
+                            menu_channel_release_1.send(()).await.unwrap();
+                            stdout.suspend_raw_mode().unwrap();
+                            if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if !raw_mode {
+                                continue;
+                            }
+                            stdout.activate_raw_mode().unwrap();
+                            handle_to_soc_send.send(String::from("\n")).await.unwrap()
+                        }
+                        Key::Ctrl('c') => {
+                            handle_to_soc_send.send(String::from("^c")).await.unwrap();
+                        }
+                        Key::Char(c) => {
+                            handle_to_soc_send.send(String::from(c)).await.unwrap();
+                        }
+                        _ => (),
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 }
