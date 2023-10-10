@@ -108,7 +108,7 @@ impl Handle {
                         Ok(val) => val,
                         Err(_) => continue,
                     };
-                    if content.trim_end().eq("quit") {
+                    if content.trim_end().eq("menu") {
                         //notify the reader that we're pausing
                         tx.send("quit").unwrap();
                         menu_channel_release_1.send(()).await.unwrap();
@@ -133,7 +133,7 @@ impl Handle {
                     }
                     let key = inp_val.unwrap();
                     match key {
-                        Key::Ctrl('x') => {
+                        Key::Ctrl('m') => {
                             tx.send("quit").unwrap();
                             menu_channel_release_1.send(()).await.unwrap();
                             stdout.suspend_raw_mode().unwrap();

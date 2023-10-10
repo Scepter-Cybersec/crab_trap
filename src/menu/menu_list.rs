@@ -42,7 +42,11 @@ fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::
 
     //start handler
     let mut stdout = stdout();
-    write!(stdout, "\r\n{guide}type \"quit\" to exit shell{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
+    if handle.raw_mode {
+        write!(stdout, "\r\n{guide}type \"CTRL + m\" to return to menu{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
+    }else{
+        write!(stdout, "\r\n{guide}type \"menu\" to return to menu{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
+    }
     handle.tx.send("start").unwrap();
 }
 
