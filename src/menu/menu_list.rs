@@ -42,10 +42,23 @@ fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::
 
     //start handler
     let mut stdout = stdout();
+    write!(stdout, "{clear}", clear = clear::BeforeCursor).unwrap();
     if handle.raw_mode {
-        write!(stdout, "\r\n{guide}type \"CTRL + m\" to return to menu{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
-    }else{
-        write!(stdout, "\r\n{guide}type \"menu\" to return to menu{reset}\r\n", guide = color::Fg(color::Red), reset = color::Fg(color::Reset)).unwrap();
+        write!(
+            stdout,
+            "\r\n{guide}type \"CTRL + b\" to return to menu{reset}\r\n",
+            guide = color::Fg(color::Red),
+            reset = color::Fg(color::Reset)
+        )
+        .unwrap();
+    } else {
+        write!(
+            stdout,
+            "\r\n{guide}type \"back\" to return to menu{reset}\r\n",
+            guide = color::Fg(color::Red),
+            reset = color::Fg(color::Reset)
+        )
+        .unwrap();
     }
     handle.tx.send("start").unwrap();
 }
@@ -149,34 +162,48 @@ macro_rules! unlock_menu {
 
 fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
     let (width, start_pos) = terminal_size().unwrap();
-    let mut msg = String::from("(ENTER - start shell) (DEL | BACK - remove shell) (ESC - back to menu) (a - rename shell)");
-    if msg.len() > width.into(){
-        let split = max(width-3, 0).into();
-        msg = String::from(&msg.as_str()[..split]);
-        msg = msg+"...";
+    let msgs = [
+        String::from("(ENTER - start shell) (DEL | BACK - remove shell) (ESC - back to menu)"),
+        String::from("(a - rename shell) (r - enter tty (raw) mode)"),
+    ];
+    for msg in msgs{
+        let mut display_msg = msg.clone();
+        if msg.len() > width.into() {
+            let split = max(width - 3, 0).into();
+            display_msg = String::from(&msg.as_str()[..split]);
+            display_msg = display_msg + "...";
+        }
+        write!(
+            stdout,
+            "\r\n{goto}{select}{msg}{reset}",
+            goto = cursor::Goto(0, start_pos),
+            msg = display_msg,
+            select = color::Bg(color::LightBlack),
+            reset = color::Bg(color::Reset)
+        )
+        .unwrap();
+        stdout.flush().unwrap();
     }
-    write!(stdout, "\r\n{goto}{select}{msg}{reset}", goto = cursor::Goto(0, start_pos), msg = msg, select = color::Bg(color::LightBlack), reset = color::Bg(color::Reset)).unwrap();
-    stdout.flush().unwrap();
 }
 
 fn refresh_list_display(
     stdout: &mut RawTerminal<Stdout>,
-    start_pos: u16,
     cur_idx: usize,
     keys: Vec<(String, connection::Handle)>,
 ) {
     write!(
         stdout,
-        "{goto}{clear}",
-        goto = cursor::Goto(0, start_pos),
-        clear = clear::AfterCursor
+        "{goto}{clear}{clear_before}",
+        goto = cursor::Goto(0, keys.len() as u16),
+        clear = clear::AfterCursor,
+        clear_before = clear::BeforeCursor
     )
     .unwrap();
     stdout.flush().unwrap();
     for (i, key) in keys.clone().into_iter().enumerate() {
         let raw_mode = match key.1.raw_mode {
             true => " (raw)",
-            false => ""
+            false => "",
         };
         let selection: String;
         if i == cur_idx {
@@ -189,7 +216,12 @@ fn refresh_list_display(
                 reset = color::Bg(color::Reset),
             );
         } else {
-            selection = format!("{key}{raw}{hide}", key = key.0, raw = raw_mode, hide = cursor::Hide,);
+            selection = format!(
+                "{key}{raw}{hide}",
+                key = key.0,
+                raw = raw_mode,
+                hide = cursor::Hide,
+            );
         }
         write!(stdout, "{}", selection).unwrap();
         if i < &keys.len() - 1 {
@@ -198,6 +230,7 @@ fn refresh_list_display(
         stdout.flush().unwrap();
     }
     list_menu_help(stdout);
+
 }
 
 pub fn new() -> MenuList {
@@ -223,7 +256,7 @@ pub fn new() -> MenuList {
                 let mut keys: Vec<String>;
 
                 keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
-                refresh_list_display(&mut stdout, start_pos, cur_idx, shell_list.to_owned());
+                refresh_list_display(&mut stdout, cur_idx, shell_list.to_owned());
 
                 let mut line_offset: i16 = 0;
                 let mut shells = connected_shells.lock().await;
@@ -259,7 +292,7 @@ pub fn new() -> MenuList {
                                 let key: String = keys[cur_idx].to_owned();
                                 let handle = match shells.get_mut(&key) {
                                     Some(han) => han,
-                                    None => return
+                                    None => return,
                                 };
                                 handle.raw_mode = !handle.raw_mode;
                                 handle.tx.send("raw").unwrap();
@@ -293,11 +326,13 @@ pub fn new() -> MenuList {
                             _ => {}
                         }
                     }
-                    shell_list = shells.iter().map(|item| (item.0.to_owned(), item.1.to_owned())).collect();
+                    shell_list = shells
+                        .iter()
+                        .map(|item| (item.0.to_owned(), item.1.to_owned()))
+                        .collect();
                     keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
                     refresh_list_display(
                         &mut stdout,
-                        (start_pos as i16 + line_offset) as u16 - shells.len() as u16,
                         cur_idx,
                         shell_list,
                     );

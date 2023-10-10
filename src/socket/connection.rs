@@ -1,15 +1,16 @@
 use std::io::{stdin, stdout};
 
 use crate::listener;
+use termion::clear;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::task;
 use tokio::select;
 use tokio::sync::broadcast::{self, Receiver as HandleReceiver, Sender as HandleSender};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::watch::Receiver;
-use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -20,7 +21,14 @@ pub struct Handle {
 }
 
 async fn handle_key_input() -> Option<Key> {
-    return match stdin().keys().next() {
+    let (tx, mut rx) = mpsc::channel(1024);
+    // stdin().keys() blocks the main thread so we have to spawn a new one and run it there
+    task::spawn(async move {
+        let key_input = stdin().keys().next();
+        tx.send(key_input).await.unwrap();
+    });
+    let key_res = rx.recv().await.unwrap();
+    return match key_res {
         Some(key) => {
             return match key {
                 Ok(val) => Some(val),
@@ -108,7 +116,8 @@ impl Handle {
                         Ok(val) => val,
                         Err(_) => continue,
                     };
-                    if content.trim_end().eq("menu") {
+                    if content.trim_end().eq("back") {
+                        println!("{clear}", clear = clear::BeforeCursor);
                         //notify the reader that we're pausing
                         tx.send("quit").unwrap();
                         menu_channel_release_1.send(()).await.unwrap();
@@ -125,15 +134,14 @@ impl Handle {
                         return;
                     }
                 } else {
-                    //need this to avoid deadlock due to std:io reading keys blocking the main thread, TODO: will eventually switch to tokyo
-                    sleep(Duration::from_millis(100)).await;
                     let inp_val = handle_key_input().await;
                     if inp_val.is_none() {
                         continue;
                     }
                     let key = inp_val.unwrap();
                     match key {
-                        Key::Ctrl('m') => {
+                        Key::Ctrl('b') => {
+                            println!("{clear}", clear = clear::BeforeCursor);
                             tx.send("quit").unwrap();
                             menu_channel_release_1.send(()).await.unwrap();
                             stdout.suspend_raw_mode().unwrap();
