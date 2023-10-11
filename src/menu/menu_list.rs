@@ -194,7 +194,7 @@ fn refresh_list_display(
     write!(
         stdout,
         "{goto}{clear}{clear_before}",
-        goto = cursor::Goto(0, keys.len() as u16),
+        goto = cursor::Goto(0, 2 as u16),
         clear = clear::AfterCursor,
         clear_before = clear::BeforeCursor
     )

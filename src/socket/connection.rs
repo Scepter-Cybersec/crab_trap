@@ -6,11 +6,11 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::task;
 use tokio::select;
 use tokio::sync::broadcast::{self, Receiver as HandleReceiver, Sender as HandleSender};
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::watch::Receiver;
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -157,8 +157,61 @@ impl Handle {
                             stdout.activate_raw_mode().unwrap();
                             handle_to_soc_send.send(String::from("\n")).await.unwrap()
                         }
-                        Key::Ctrl('c') => {
-                            handle_to_soc_send.send(String::from("^c")).await.unwrap();
+                        Key::Esc => {
+                            handle_to_soc_send
+                                .send(String::from_utf8_lossy(&([0x1b] as [u8; 1])).into_owned())
+                                .await
+                                .unwrap();
+                        }
+                        Key::Delete | Key::Backspace => {
+                            handle_to_soc_send
+                                .send(String::from_utf8_lossy(&([0x7f] as [u8; 1])).into_owned())
+                                .await
+                                .unwrap();
+                        }
+                        Key::Char('\n') | Key::Char('\r') => {
+                            handle_to_soc_send
+                                .send(String::from_utf8_lossy(&([0x0d] as [u8; 1])).into_owned())
+                                .await
+                                .unwrap();
+                        }
+                        Key::Up | Key::Left | Key::Right | Key::Down => {
+                            let dir_key = match key {
+                                Key::Up => 0x41,
+                                Key::Left => 0x44,
+                                Key::Right => 0x43,
+                                Key::Down => 0x42,
+                                _ => continue,
+                            };
+                            handle_to_soc_send
+                                .send(
+                                    String::from_utf8_lossy(&([0x1b, 0x4f, dir_key] as [u8; 3]))
+                                        .into_owned(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        Key::Alt(ch) => {
+                            handle_to_soc_send
+                                .send(
+                                    String::from_utf8_lossy(&([0x1b, ch as u8] as [u8; 2]))
+                                        .into_owned(),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        Key::Ctrl(ch) => {
+                            let low_ch = ch.to_ascii_lowercase();
+                            if low_ch as u8 > 96 {
+                                let ctrl_digit = low_ch as u8 - 96;
+                                handle_to_soc_send
+                                    .send(
+                                        String::from_utf8_lossy(&([ctrl_digit] as [u8; 1]))
+                                            .into_owned(),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
                         }
                         Key::Char(c) => {
                             handle_to_soc_send.send(String::from(c)).await.unwrap();

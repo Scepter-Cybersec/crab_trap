@@ -69,9 +69,7 @@ pub fn start_socket(
                             }
                             socket.flush().await.unwrap();
                         }
-                        None => {
-                            println!("here none\r");
-                        },
+                        None => (),
                     };
                 }
                 item = socket.read(&mut buf) => {
