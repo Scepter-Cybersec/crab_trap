@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use menu::menu_list::clear;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use rustyline::DefaultEditor;
+use tokio::io::{self, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
@@ -35,6 +36,8 @@ fn input_loop(
             .await
             .unwrap();
         stdout.flush().await.unwrap_or_default();
+
+        let mut menu_rl = DefaultEditor::new().unwrap();
         menu_list::help();
         loop {
             let (_, height) = termion::terminal_size().unwrap();
@@ -45,15 +48,15 @@ fn input_loop(
                 red = color::Fg(color::LightRed),
                 reset = color::Fg(color::Reset)
             );
-            stdout.write_all(prompt.as_bytes()).await.unwrap();
-            stdout.flush().await.unwrap();
-            let mut reader = BufReader::new(tokio::io::stdin());
-            let mut buffer = Vec::new();
-            reader.read_until(b'\n', &mut buffer).await.unwrap();
-            let content = match String::from_utf8(buffer) {
-                Ok(val) => val,
-                Err(_) => continue,
+
+            let content = match menu_rl.readline(prompt.as_str()){
+                Ok(line)=>{
+                    menu_rl.add_history_entry(line.as_str()).unwrap_or_default();
+                    line
+                },
+                Err(_)=>continue
             };
+            
             let key = String::from(content.trim_end());
 
             let entry = match menu.get(&*key) {

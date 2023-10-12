@@ -25,15 +25,20 @@ pub fn help() {
     println!("l - list the connected shells");
     println!("h - display this help message");
     println!("clear - clear the display");
+    println!("exit - quit the program");
 }
 
 pub fn clear() {
     println!("{clear}", clear = clear::All);
 }
 
+pub fn exit() {
+    std::process::exit(0)
+}
+
 fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::Handle>>) {
     let handle = match connected_shells.get(&key) {
-        Some(val) => val,
+        Some(val) => {val},
         None => {
             println!("Invalid session key!");
             return;
@@ -166,7 +171,7 @@ fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
         String::from("(ENTER - start shell) (DEL | BACK - remove shell) (ESC - back to menu)"),
         String::from("(a - rename shell) (r - enter tty (raw) mode)"),
     ];
-    for msg in msgs{
+    for msg in msgs {
         let mut display_msg = msg.clone();
         if msg.len() > width.into() {
             let split = max(width - 3, 0).into();
@@ -230,7 +235,6 @@ fn refresh_list_display(
         stdout.flush().unwrap();
     }
     list_menu_help(stdout);
-
 }
 
 pub fn new() -> MenuList {
@@ -331,11 +335,7 @@ pub fn new() -> MenuList {
                         .map(|item| (item.0.to_owned(), item.1.to_owned()))
                         .collect();
                     keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
-                    refresh_list_display(
-                        &mut stdout,
-                        cur_idx,
-                        shell_list,
-                    );
+                    refresh_list_display(&mut stdout, cur_idx, shell_list);
                 }
             }
             unlock_menu!(menu_channel_release);
@@ -350,6 +350,8 @@ pub fn new() -> MenuList {
     menu.insert("clear", Box::new(clear));
 
     menu.insert("h", Box::new(|_, _| help()));
+
+    menu.insert("exit", Box::new(|_, _| exit()));
 
     return menu;
 }
