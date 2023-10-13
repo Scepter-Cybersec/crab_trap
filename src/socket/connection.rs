@@ -2,6 +2,7 @@ use std::io::{stdin, stdout};
 use std::sync::Arc;
 
 use crate::listener;
+use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{Config, Editor};
 use termion::clear;
@@ -44,8 +45,11 @@ async fn handle_key_input() -> Option<Key> {
     };
 }
 
-async fn read_line(rl: Arc<Mutex<Editor<(), FileHistory>>>, prompt: Option<&str>) -> String {
-    let (tx, mut rx) = mpsc::channel::<String>(1024);
+async fn read_line(
+    rl: Arc<Mutex<Editor<(), FileHistory>>>,
+    prompt: Option<&str>,
+) -> Result<String, ReadlineError> {
+    let (tx, mut rx) = mpsc::channel::<Result<String, ReadlineError>>(1024);
     let input_prompt = match prompt {
         Some(val) => String::from(val),
         None => String::from(""),
@@ -58,14 +62,14 @@ async fn read_line(rl: Arc<Mutex<Editor<(), FileHistory>>>, prompt: Option<&str>
         let content = match raw_content {
             Ok(line) => {
                 reader.add_history_entry(line.clone()).unwrap_or_default();
-                line + "\n"
+                Ok(line + "\n")
             }
-            Err(_) => String::from(""),
+            Err(e) => Err(e),
         };
         tx.send(content).await.unwrap_or_default();
     });
-    let received_content = rx.recv().await.unwrap_or_default();
-    return received_content;
+    let received_content = rx.recv().await.unwrap()?;
+    return Ok(received_content);
 }
 
 impl Handle {
@@ -153,7 +157,10 @@ impl Handle {
                 if !raw_mode {
                     stdout.suspend_raw_mode().unwrap();
                     let new_prompt = prompt_rx.borrow_and_update().to_owned();
-                    let mut content = read_line(rl.clone(), Some(new_prompt.as_str())).await;
+                    let mut content = match read_line(rl.clone(), Some(new_prompt.as_str())).await {
+                        Ok(val) => val,
+                        Err(_) => continue,
+                    };
 
                     if content.trim_end().eq("back") {
                         println!("{clear}", clear = clear::BeforeCursor);
