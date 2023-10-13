@@ -1,71 +1,149 @@
 use std::collections::HashMap;
-use std::env;
+use std::env::{self, set_current_dir};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use menu::menu_list::clear;
+use rustyline::DefaultEditor;
+use tokio::io::{self, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::process::Command;
+use tokio::time::sleep;
 
 use crate::menu::menu_list;
 use crate::socket::{connection, listener};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use tokio::sync::{mpsc, Mutex};
-use sha256::{digest};
+use sha256::digest;
+use std::io::Write;
+use termion::{self, color, cursor};
+use tokio::sync::{mpsc, watch, Mutex};
 
 mod menu;
 mod socket;
 
-fn input_loop(connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>, menu: menu_list::MenuList){
+fn input_loop(
+    shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
+    menu: menu_list::MenuList,
+    mut menu_channel_acquire: mpsc::Receiver<()>,
+    menu_channel_release: mpsc::Sender<()>,
+    init_message: Option<String>,
+) {
     tokio::spawn(async move {
         let mut stdout = io::stdout();
+        let (_, height) = termion::terminal_size().unwrap();
+        let msg_start = height - (menu.len() as u16);
+        stdout
+            .write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes())
+            .await
+            .unwrap();
+        stdout.flush().await.unwrap_or_default();
+
+        let mut menu_rl = DefaultEditor::new().unwrap();
+        clear();
+        if init_message.is_some() {
+            let msg = init_message.unwrap();
+            println!("{msg}\n");
+        }
+
         menu_list::help();
         loop {
-            stdout.write_all("crab_trap 🦀# ".as_bytes()).await.unwrap();
-            stdout.flush().await.unwrap();
-            let mut reader = BufReader::new(tokio::io::stdin());
-            let mut buffer = Vec::new();
-            reader.read_until(b'\n', &mut buffer).await.unwrap();
-            let content = match String::from_utf8(buffer) {
-                Ok(val) => val,
+            let (_, height) = termion::terminal_size().unwrap();
+            let mut pwd = match env::current_dir() {
+                Ok(path) => String::from(path.to_str().unwrap_or("")),
+                Err(_) => String::from(""),
+            };
+            let home = match dirs::home_dir() {
+                Some(p) => String::from(p.to_str().unwrap_or("")),
+                None => String::from(""),
+            };
+            pwd = pwd.replace(&home, "~");
+            let prompt = format!(
+                "{bottom}{red}crab_trap 🦀:{pwd} #{reset} ",
+                bottom = cursor::Goto(0, height),
+                red = color::Fg(color::LightRed),
+                reset = color::Fg(color::Reset)
+            );
+
+            let content = match menu_rl.readline(prompt.as_str()) {
+                Ok(line) => {
+                    menu_rl.add_history_entry(line.as_str()).unwrap_or_default();
+                    line
+                }
                 Err(_) => continue,
             };
-            let clean_content = String::from(content.trim_end());
-            let args = clean_content.split(" ").collect::<Vec<&str>>();
 
-            let map_key = args[0];
-            let menu_arg: Option<Vec<&str>>;
-            if args.len() > 1 {
-                menu_arg = Some(args[1..].to_vec());
-            } else {
-                menu_arg = None;
-            }
-            if !map_key.eq(&String::new()) {
-                let menu_entry = menu.get(map_key);
-                let handle: Option<connection::Handle>;
-                {
-                    let shells = connected_shells.lock().await;
-                    handle = match shells.get(menu_arg.clone().unwrap_or(vec![""])[0]) {
-                        Some(val) => Some(val.clone()),
-                        None => None,
-                    };
-                    match menu_entry {
-                        Some(f) => f(shells, menu_arg),
-                        None => menu_list::help(),
-                    };
-                }
+            let key = String::from(content.trim_end());
 
-                if map_key.eq("s") && handle.is_some() {
-                    loop {
-                        let handle_clone = handle.clone();
-                        match handle_clone.unwrap().ingress.lock().await.recv().await {
-                            Some("pause") => break,
-                            Some(_) => continue,
-                            None => continue,
+            let entry = match menu.get(&*key) {
+                Some(val) => val,
+                None => {
+                    // need to handle cd differently
+                    if key.starts_with("cd ") {
+                        let mut dir = String::from(key.split(" ").last().unwrap_or_default());
+                        if dir.len() <= 0 {
+                            continue;
                         }
+                        dir = dir.replace("~", &home);
+                        let err = set_current_dir(dir).err();
+                        if err.is_some() {
+                            let display_err = err.unwrap();
+                            println!("error changing directories: {display_err}");
+                        }
+                    } else {
+                        let output = if cfg!(target_os = "windows") {
+                            Command::new("cmd")
+                                .args(["/C", key.as_str()])
+                                .output()
+                                .await
+                                .unwrap()
+                        } else {
+                            Command::new("sh")
+                                .arg("-c")
+                                .arg(key.as_str())
+                                .output()
+                                .await
+                                .unwrap()
+                        };
+
+                        let out = output.stdout;
+                        let err = output.stderr;
+                        std::io::stdout().write_all(&out).unwrap();
+                        std::io::stderr().write_all(&err).unwrap();
                     }
+                    continue;
+                }
+            };
+
+            entry(shells.clone(), menu_channel_release.clone());
+
+            if !key.eq(&String::new()) {
+                if key.eq("l") {
+                    menu_channel_acquire.recv().await.unwrap();
                 }
             }
         }
     });
+}
+
+async fn soc_is_shell(soc: &mut TcpStream, soc_key: String) -> bool {
+    soc.write(format!("echo {}\r\n", soc_key).as_bytes())
+        .await
+        .unwrap();
+    let mut buf: [u8; 4096] = [0; 4096];
+    for _ in 0..10 {
+        let len = soc.try_read(&mut buf);
+        if len.is_ok() {
+            let content: String = String::from_utf8_lossy(&buf[..len.unwrap()]).into();
+            if content.contains(&soc_key) {
+                // add a new line so we get our prompt back
+                soc.write("\n".as_bytes()).await.unwrap();
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    return false;
 }
 
 #[tokio::main]
@@ -91,119 +169,61 @@ async fn main() {
         return;
     }
     let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-
+    let (menu_channel_release, menu_channel_acquire) = mpsc::channel::<()>(1024);
     let menu = menu_list::new();
 
-    // start main input listener
-    let connected_shells_menu = connected_shells.clone();
-    
     // get user input
-    input_loop(connected_shells_menu, menu);
-
+    let init_message = format!(
+        "{red}listening on {bound_addr}:{bound_port}{reset}",
+        red = color::Fg(color::LightRed),
+        reset = color::Fg(color::Reset)
+    );
+    input_loop(
+        connected_shells.clone(),
+        menu,
+        menu_channel_acquire,
+        menu_channel_release.clone(),
+        Some(init_message),
+    );
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
 
     let connected_shells_socket = connected_shells.clone();
     loop {
-        let soc = socket_stream.next().await.unwrap().unwrap();
+        let mut soc = socket_stream.next().await.unwrap().unwrap();
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
-        let (soc_to_handle_send, mut soc_to_handle_recv) = mpsc::channel::<String>(1024);
+        let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
 
-        let (handle, handle_ingress_sender, handle_egress_receiver, soc_kill_sig_recv) =
-            connection::Handle::new();
-        {
-            let mut shells = connected_shells_socket.lock().await;
+        let (handle, _, soc_kill_sig_recv) = connection::Handle::new();
+        let connected_shells_copy = connected_shells_socket.clone();
+
+        let menu_release_copy = menu_channel_release.clone();
+        tokio::spawn(async move {
             let soc_key: String;
             match &soc.peer_addr() {
                 Ok(val) => {
                     soc_key = digest(val.to_string())[0..31].to_string();
-                    shells.insert(soc_key, handle);
-                }
-                Err(_) => continue,
-            }
-        }
 
-        listener::start_socket(
-            soc,
-            soc_to_handle_send,
-            handle_to_soc_recv,
-            soc_kill_sig_recv,
-        );
-
-        let mut handle_egress_receiver_1 = handle_egress_receiver.clone();
-
-        // start writer
-        tokio::spawn(async move {
-            // wait for start signal
-            if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            loop {
-                let mut reader = BufReader::new(tokio::io::stdin());
-                let mut buffer = Vec::new();
-                reader.read_until(b'\n', &mut buffer).await.unwrap();
-                let mut content = match String::from_utf8(buffer) {
-                    Ok(val) => val,
-                    Err(_) => continue,
-                };
-                if content.trim_end().eq("quit") {
-                    handle_ingress_sender.send("pause").await.unwrap();
-                    // send a new line so we get a prompt when we return
-                    content = String::from("\n");
-                    if listener::wait_for_signal(&mut handle_egress_receiver_1, "start")
-                        .await
-                        .is_err()
-                    {
+                    let is_shell = soc_is_shell(&mut soc, soc_key.clone()).await;
+                    if is_shell {
+                        let mut shells = connected_shells_copy.lock().await;
+                        listener::start_socket(
+                            soc,
+                            soc_to_handle_send,
+                            handle_to_soc_recv,
+                            soc_kill_sig_recv,
+                        );
+                        handle.handle_listen(
+                            handle_to_soc_send,
+                            soc_to_handle_recv,
+                            menu_release_copy,
+                        );
+                        shells.insert(soc_key, handle);
+                    } else {
                         return;
                     }
                 }
-                if handle_to_soc_send.send(content).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        // start reader
-        let mut handle_egress_receiver_2 = handle_egress_receiver;
-        tokio::spawn(async move {
-            // wait for start signal
-            if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-                .await
-                .is_err()
-            {
-                return;
-            };
-
-            let mut stdout = io::stdout();
-            loop {
-                stdout.flush().await.unwrap();
-
-                let resp = match soc_to_handle_recv.recv().await {
-                    Some(val) => val,
-                    None => String::from(""),
-                };
-
-                let changed = match handle_egress_receiver_2.has_changed() {
-                    Ok(val) => val,
-                    Err(_) => return,
-                };
-                if changed {
-                    let val = *handle_egress_receiver_2.borrow();
-                    if val.eq("pause") {
-                        if listener::wait_for_signal(&mut handle_egress_receiver_2, "start")
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        };
-                        continue;
-                    }
-                }
-                stdout.write_all(resp.as_bytes()).await.unwrap();
+                Err(_) => return,
             }
         });
     }
