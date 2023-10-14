@@ -285,8 +285,6 @@ impl Handle {
 
 #[cfg(test)]
 mod tests {
-    use std::io::stdout;
-
     use termion::raw::IntoRawMode;
     use tokio::{net::{TcpListener, TcpStream}, io::AsyncWriteExt};
 
@@ -307,7 +305,7 @@ mod tests {
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
         let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
         let (menu_channel_release, _) = mpsc::channel::<()>(1024);
-        let out = stdout().into_raw_mode().unwrap();
+        let out = std::io::Cursor::new(Vec::new()).into_raw_mode().unwrap();
         listener::start_socket(
             stream,
             soc_to_handle_send,
