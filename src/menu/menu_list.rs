@@ -262,9 +262,9 @@ pub fn new() -> MenuList {
                 keys = shell_list.iter().map(|item| item.0.to_owned()).collect();
                 refresh_list_display(&mut stdout, cur_idx, shell_list.to_owned());
 
-                let mut line_offset: i16 = 0;
                 let mut shells = connected_shells.lock().await;
                 for key in stdin.keys() {
+                    stdout.activate_raw_mode().unwrap();
                     {
                         match key.unwrap() {
                             Key::Esc => {
@@ -304,7 +304,6 @@ pub fn new() -> MenuList {
                             Key::Delete | Key::Backspace => {
                                 let key: String = keys[cur_idx].to_owned();
                                 delete(key, &mut shells);
-                                line_offset -= 1;
                                 if cur_idx > 0 {
                                     cur_idx -= 1;
                                 }
@@ -321,7 +320,7 @@ pub fn new() -> MenuList {
 
                                 alias(
                                     key,
-                                    (((start_pos + cur_idx as u16) as i16 + line_offset)
+                                    (((start_pos + cur_idx as u16) as i16)
                                         - (shells.len() as i16))
                                         as u16,
                                     &mut shells,

@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use menu::menu_list::clear;
 use rustyline::DefaultEditor;
-use tokio::io::{self, AsyncWriteExt};
+use termion::raw::IntoRawMode;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::process::Command;
+use std::process::Command;
 use tokio::time::sleep;
 
 use crate::menu::menu_list;
@@ -15,8 +16,8 @@ use crate::socket::{connection, listener};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use sha256::digest;
-use std::io::Write;
-use termion::{self, color, cursor};
+use std::io::stdout;
+use termion::{self, color};
 use tokio::sync::{mpsc, watch, Mutex};
 
 mod menu;
@@ -30,15 +31,6 @@ fn input_loop(
     init_message: Option<String>,
 ) {
     tokio::spawn(async move {
-        let mut stdout = io::stdout();
-        let (_, height) = termion::terminal_size().unwrap();
-        let msg_start = height - (menu.len() as u16);
-        stdout
-            .write_all(format!("{start}", start = cursor::Goto(0, msg_start)).as_bytes())
-            .await
-            .unwrap();
-        stdout.flush().await.unwrap_or_default();
-
         let mut menu_rl = DefaultEditor::new().unwrap();
         clear();
         if init_message.is_some() {
@@ -48,7 +40,8 @@ fn input_loop(
 
         menu_list::help();
         loop {
-            let (_, height) = termion::terminal_size().unwrap();
+            let stdout = stdout().into_raw_mode().unwrap();
+            stdout.suspend_raw_mode().unwrap();
             let mut pwd = match env::current_dir() {
                 Ok(path) => String::from(path.to_str().unwrap_or("")),
                 Err(_) => String::from(""),
@@ -59,15 +52,16 @@ fn input_loop(
             };
             pwd = pwd.replace(&home, "~");
             let prompt = format!(
-                "{bottom}{red}crab_trap 🦀:{pwd} #{reset} ",
-                bottom = cursor::Goto(0, height),
+                "{red}crab_trap 🦀:{pwd} #{reset} ",
                 red = color::Fg(color::LightRed),
                 reset = color::Fg(color::Reset)
             );
 
             let content = match menu_rl.readline(prompt.as_str()) {
                 Ok(line) => {
-                    menu_rl.add_history_entry(line.as_str()).unwrap_or_default();
+                    menu_rl
+                        .add_history_entry(line.as_str())
+                        .unwrap_or_default();
                     line
                 }
                 Err(_) => continue,
@@ -91,25 +85,13 @@ fn input_loop(
                             println!("error changing directories: {display_err}");
                         }
                     } else {
-                        let output = if cfg!(target_os = "windows") {
-                            Command::new("cmd")
-                                .args(["/C", key.as_str()])
-                                .output()
-                                .await
-                                .unwrap()
-                        } else {
-                            Command::new("sh")
-                                .arg("-c")
-                                .arg(key.as_str())
-                                .output()
-                                .await
-                                .unwrap()
-                        };
-
-                        let out = output.stdout;
-                        let err = output.stderr;
-                        std::io::stdout().write_all(&out).unwrap();
-                        std::io::stderr().write_all(&err).unwrap();
+                        Command::new("sh")
+                            .arg("-c")
+                            .arg(key)
+                            .spawn()
+                            .expect("Failed to run command")
+                            .wait_with_output()
+                            .unwrap();
                     }
                     continue;
                 }
@@ -199,11 +181,11 @@ async fn main() {
 
         let menu_release_copy = menu_channel_release.clone();
         tokio::spawn(async move {
+            let stdout = stdout().into_raw_mode().unwrap();
             let soc_key: String;
             match &soc.peer_addr() {
                 Ok(val) => {
                     soc_key = digest(val.to_string())[0..31].to_string();
-
                     let is_shell = soc_is_shell(&mut soc, soc_key.clone()).await;
                     if is_shell {
                         let mut shells = connected_shells_copy.lock().await;
@@ -217,6 +199,7 @@ async fn main() {
                             handle_to_soc_send,
                             soc_to_handle_recv,
                             menu_release_copy,
+                            stdout,
                         );
                         shells.insert(soc_key, handle);
                     } else {

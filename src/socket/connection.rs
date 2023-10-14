@@ -1,4 +1,4 @@
-use std::io::{stdin, stdout};
+use std::io::{stdin, Stdout, Write};
 use std::sync::Arc;
 
 use crate::listener;
@@ -8,8 +8,7 @@ use rustyline::{Config, Editor};
 use termion::clear;
 use termion::event::Key;
 use termion::input::TermRead;
-use termion::raw::IntoRawMode;
-use tokio::io::{self, AsyncWriteExt};
+use termion::raw::RawTerminal;
 use tokio::select;
 use tokio::sync::broadcast::{self, Receiver as HandleReceiver, Sender as HandleSender};
 use tokio::sync::mpsc::{self, Sender};
@@ -45,7 +44,7 @@ async fn handle_key_input() -> Option<Key> {
     };
 }
 
-async fn read_line(
+pub async fn read_line(
     rl: Arc<Mutex<Editor<(), FileHistory>>>,
     prompt: Option<&str>,
 ) -> Result<String, ReadlineError> {
@@ -97,6 +96,7 @@ impl Handle {
         handle_to_soc_send: Sender<String>,
         mut soc_to_handle_recv: Receiver<String>,
         menu_channel_release: Sender<()>,
+        mut stdout: RawTerminal<Stdout>,
     ) {
         let menu_channel_release_1 = menu_channel_release.clone();
         let tx = self.tx.clone();
@@ -104,6 +104,7 @@ impl Handle {
         let tx_copy = self.tx.clone();
         let mut raw_mode = self.raw_mode;
         let (prompt_tx, mut prompt_rx) = watch::channel(String::from(""));
+        let (raw_mode_tx, mut raw_mode_rx) = mpsc::channel::<bool>(1024);
         // start reader
         tokio::spawn(async move {
             let mut active = false;
@@ -122,13 +123,12 @@ impl Handle {
                 select! {
                     _ = soc_to_handle_recv.changed() =>{
                         let resp = soc_to_handle_recv.borrow().to_owned();
-                        let mut stdout = io::stdout();
                         let outp =match raw_mode{
                             true =>resp,
                             false => format!("{clear}\r{resp}", clear = clear::CurrentLine)
                         };
-                        stdout.write_all(outp.as_bytes()).await.unwrap();
-                        stdout.flush().await.unwrap();
+                        stdout.write_all(outp.as_bytes()).unwrap();
+                        stdout.flush().unwrap();
                         let new_prompt = match outp.split("\n").last(){
                             Some(s)=>s,
                             None => ""
@@ -138,7 +138,18 @@ impl Handle {
                         }
                     }
                     _ = listener::wait_for_signal(tx_copy.subscribe(), "quit", &mut raw_mode) =>{
-                        active = false
+                        stdout.suspend_raw_mode().unwrap();
+                        active = false;
+                    }
+                    raw_term_state = raw_mode_rx.recv() =>{
+                        if raw_term_state.is_none(){
+                            println!("Terminal closed");
+                            continue;
+                        }
+                        match raw_term_state.unwrap(){
+                            true => stdout.activate_raw_mode().unwrap_or_default(),
+                            false => stdout.suspend_raw_mode().unwrap_or_default()
+                        };
                     }
                 }
             }
@@ -153,9 +164,8 @@ impl Handle {
                 return;
             }
             loop {
-                let stdout = stdout().into_raw_mode().unwrap();
                 if !raw_mode {
-                    stdout.suspend_raw_mode().unwrap();
+                    raw_mode_tx.send(false).await.unwrap();
                     let new_prompt = prompt_rx.borrow_and_update().to_owned();
                     let mut content = match read_line(rl.clone(), Some(new_prompt.as_str())).await {
                         Ok(val) => val,
@@ -180,6 +190,7 @@ impl Handle {
                         return;
                     }
                 } else {
+                    raw_mode_tx.send(true).await.unwrap();
                     let inp_val = handle_key_input().await;
                     if inp_val.is_none() {
                         continue;
@@ -189,8 +200,8 @@ impl Handle {
                         Key::Ctrl('b') => {
                             println!("{clear}", clear = clear::BeforeCursor);
                             tx.send("quit").unwrap();
+                            raw_mode_tx.send(false).await.unwrap();
                             menu_channel_release_1.send(()).await.unwrap();
-                            stdout.suspend_raw_mode().unwrap();
                             if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
                                 .await
                                 .is_err()
@@ -200,7 +211,7 @@ impl Handle {
                             if !raw_mode {
                                 continue;
                             }
-                            stdout.activate_raw_mode().unwrap();
+                            raw_mode_tx.send(true).await.unwrap();
                             handle_to_soc_send.send(String::from("\n")).await.unwrap()
                         }
                         Key::Esc => {
