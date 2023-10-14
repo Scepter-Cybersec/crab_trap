@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use menu::menu_list::clear;
 use rustyline::DefaultEditor;
+use std::process::Command;
 use termion::raw::IntoRawMode;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use std::process::Command;
 use tokio::time::sleep;
 
 use crate::menu::menu_list;
@@ -22,6 +22,24 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 mod menu;
 mod socket;
+
+fn get_prompt() -> (String, String) {
+    let mut pwd = match env::current_dir() {
+        Ok(path) => String::from(path.to_str().unwrap_or("")),
+        Err(_) => String::from(""),
+    };
+    let home = match dirs::home_dir() {
+        Some(p) => String::from(p.to_str().unwrap_or("")),
+        None => String::from(""),
+    };
+    pwd = pwd.replace(&home, "~");
+    let prompt = format!(
+        "{red}crab_trap 🦀:{pwd} #{reset} ",
+        red = color::Fg(color::LightRed),
+        reset = color::Fg(color::Reset)
+    );
+    return (prompt, home);
+}
 
 fn input_loop(
     shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
@@ -42,26 +60,10 @@ fn input_loop(
         loop {
             let stdout = stdout().into_raw_mode().unwrap();
             stdout.suspend_raw_mode().unwrap();
-            let mut pwd = match env::current_dir() {
-                Ok(path) => String::from(path.to_str().unwrap_or("")),
-                Err(_) => String::from(""),
-            };
-            let home = match dirs::home_dir() {
-                Some(p) => String::from(p.to_str().unwrap_or("")),
-                None => String::from(""),
-            };
-            pwd = pwd.replace(&home, "~");
-            let prompt = format!(
-                "{red}crab_trap 🦀:{pwd} #{reset} ",
-                red = color::Fg(color::LightRed),
-                reset = color::Fg(color::Reset)
-            );
-
+            let (prompt, home) = get_prompt();
             let content = match menu_rl.readline(prompt.as_str()) {
                 Ok(line) => {
-                    menu_rl
-                        .add_history_entry(line.as_str())
-                        .unwrap_or_default();
+                    menu_rl.add_history_entry(line.as_str()).unwrap_or_default();
                     line
                 }
                 Err(_) => continue,
@@ -118,14 +120,59 @@ async fn soc_is_shell(soc: &mut TcpStream, soc_key: String) -> bool {
         if len.is_ok() {
             let content: String = String::from_utf8_lossy(&buf[..len.unwrap()]).into();
             if content.contains(&soc_key) {
-                // add a new line so we get our prompt back
-                soc.write("\n".as_bytes()).await.unwrap();
+                // add a new line so we get our prompt back, also check to make sure the socket did not just close
+                soc.write("\n".as_bytes()).await.unwrap_or_default();
                 return true;
             }
         }
         sleep(Duration::from_millis(200)).await;
     }
     return false;
+}
+
+async fn handle_new_shell(
+    mut soc: TcpStream,
+    connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
+    menu_channel_release: mpsc::Sender<()>,
+    skip_validation: Option<bool>,
+) {
+    let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
+    let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
+
+    let (handle, soc_kill_sig_recv) = connection::Handle::new();
+
+    tokio::spawn(async move {
+        let stdout = stdout().into_raw_mode().unwrap();
+        let soc_key: String;
+        match &soc.peer_addr() {
+            Ok(val) => {
+                soc_key = digest(val.to_string())[0..31].to_string();
+                let is_shell = match skip_validation {
+                    Some(true) => true,
+                    _ => soc_is_shell(&mut soc, soc_key.clone()).await,
+                };
+                if is_shell {
+                    let mut shells = connected_shells.lock().await;
+                    listener::start_socket(
+                        soc,
+                        soc_to_handle_send,
+                        handle_to_soc_recv,
+                        soc_kill_sig_recv,
+                    );
+                    handle.handle_listen(
+                        handle_to_soc_send,
+                        soc_to_handle_recv,
+                        menu_channel_release,
+                        stdout,
+                    );
+                    shells.insert(soc_key, handle);
+                } else {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    });
 }
 
 #[tokio::main]
@@ -170,44 +217,64 @@ async fn main() {
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
 
-    let connected_shells_socket = connected_shells.clone();
     loop {
-        let mut soc = socket_stream.next().await.unwrap().unwrap();
-        let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
-        let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
+        let soc = socket_stream.next().await.unwrap().unwrap();
+        handle_new_shell(
+            soc,
+            connected_shells.clone(),
+            menu_channel_release.clone(),
+            None,
+        )
+        .await;
+    }
+}
 
-        let (handle, _, soc_kill_sig_recv) = connection::Handle::new();
-        let connected_shells_copy = connected_shells_socket.clone();
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
 
-        let menu_release_copy = menu_channel_release.clone();
+    use super::*;
+
+    #[test]
+    fn test_prompt() {
+        let (prompt, home) = get_prompt();
+        assert!(prompt
+            .starts_with(format!("{red}crab_trap 🦀:", red = color::Fg(color::LightRed)).as_str()));
+        assert_ne!(home, "");
+    }
+
+    #[tokio::test]
+    async fn test_soc_is_shell() {
+        let listener_res = TcpListener::bind("127.0.0.1:32423").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
         tokio::spawn(async move {
-            let stdout = stdout().into_raw_mode().unwrap();
-            let soc_key: String;
-            match &soc.peer_addr() {
-                Ok(val) => {
-                    soc_key = digest(val.to_string())[0..31].to_string();
-                    let is_shell = soc_is_shell(&mut soc, soc_key.clone()).await;
-                    if is_shell {
-                        let mut shells = connected_shells_copy.lock().await;
-                        listener::start_socket(
-                            soc,
-                            soc_to_handle_send,
-                            handle_to_soc_recv,
-                            soc_kill_sig_recv,
-                        );
-                        handle.handle_listen(
-                            handle_to_soc_send,
-                            soc_to_handle_recv,
-                            menu_release_copy,
-                            stdout,
-                        );
-                        shells.insert(soc_key, handle);
-                    } else {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
+            let (mut soc, _) = listener.accept().await.unwrap();
+            soc.write("test123\n".as_bytes()).await.unwrap();
         });
+        let mut stream = TcpStream::connect("127.0.0.1:32423").await.unwrap();
+        assert!(soc_is_shell(&mut stream, String::from("test123")).await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_shell() {
+        let listener_res = TcpListener::bind("127.0.0.1:32424").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        tokio::spawn(async move {
+            let (soc, _) = listener.accept().await.unwrap();
+            let connected_shells =
+                Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
+            let (menu_channel_release, _) = mpsc::channel::<()>(1024);
+            handle_new_shell(
+                soc,
+                connected_shells.clone(),
+                menu_channel_release,
+                Some(true),
+            )
+            .await;
+            assert!(connected_shells.lock().await.len() > 0);
+        });
+        TcpStream::connect("127.0.0.1:32424").await.unwrap();
     }
 }

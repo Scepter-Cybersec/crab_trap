@@ -1,4 +1,4 @@
-use std::io::{stdin, Stdout, Write};
+use std::io::{stdin, Write};
 use std::sync::Arc;
 
 use crate::listener;
@@ -10,7 +10,7 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::RawTerminal;
 use tokio::select;
-use tokio::sync::broadcast::{self, Receiver as HandleReceiver, Sender as HandleSender};
+use tokio::sync::broadcast::{self, Sender as HandleSender};
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::watch::{self, Receiver};
 use tokio::sync::Mutex;
@@ -72,8 +72,8 @@ pub async fn read_line(
 }
 
 impl Handle {
-    pub fn new() -> (Handle, HandleReceiver<&'static str>, CancellationToken) {
-        let (tx, rx) = broadcast::channel::<&str>(1024);
+    pub fn new() -> (Handle, CancellationToken) {
+        let (tx, _) = broadcast::channel::<&str>(1024);
         let soc_kill_token = CancellationToken::new();
         let soc_kill_token_listen = soc_kill_token.clone();
         let mut builder = Config::builder();
@@ -88,16 +88,18 @@ impl Handle {
             soc_kill_token,
             raw_mode: false,
         };
-        return (handle, rx, soc_kill_token_listen);
+        return (handle, soc_kill_token_listen);
     }
 
-    pub fn handle_listen(
+    pub fn handle_listen<W>(
         &self,
         handle_to_soc_send: Sender<String>,
         mut soc_to_handle_recv: Receiver<String>,
         menu_channel_release: Sender<()>,
-        mut stdout: RawTerminal<Stdout>,
-    ) {
+        mut stdout: RawTerminal<W>,
+    ) where
+        W: Write + Send + 'static,
+    {
         let menu_channel_release_1 = menu_channel_release.clone();
         let tx = self.tx.clone();
         let rl = self.rl.clone();
@@ -278,5 +280,54 @@ impl Handle {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use termion::raw::IntoRawMode;
+    use tokio::{net::{TcpListener, TcpStream}, io::AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_handle() {
+        let listener_res = TcpListener::bind("127.0.0.1:32426").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        tokio::spawn(async move {
+            let (mut tcp_stream, _) = listener.accept().await.unwrap();
+            //mock return vale from soc
+            tcp_stream.write("mock value".as_bytes()).await.unwrap();
+        });
+        let stream = TcpStream::connect("127.0.0.1:32426").await.unwrap();
+        let (handle, cancel_token) = Handle::new();
+        let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
+        let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
+        let (menu_channel_release, _) = mpsc::channel::<()>(1024);
+        let out = std::io::Cursor::new(Vec::new()).into_raw_mode().unwrap();
+        listener::start_socket(
+            stream,
+            soc_to_handle_send,
+            handle_to_soc_recv,
+            cancel_token,
+        );
+        handle.handle_listen(
+            handle_to_soc_send.clone(),
+            soc_to_handle_recv.clone(),
+            menu_channel_release,
+            out
+        );
+        let mut rx = handle.tx.subscribe();
+
+        //test handle channel send/receive
+        tokio::spawn(async move{
+            assert_eq!(rx.recv().await.unwrap(), "start");
+        });
+        handle.tx.send("start").unwrap();
+
+
+        soc_to_handle_recv.clone().changed().await.unwrap();
+        assert_eq!("mock value", soc_to_handle_recv.borrow().as_str());
     }
 }
