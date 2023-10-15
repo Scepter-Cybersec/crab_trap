@@ -44,8 +44,6 @@ fn get_prompt() -> (String, String) {
 fn input_loop(
     shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
     menu: menu_list::MenuList,
-    mut menu_channel_acquire: mpsc::Receiver<()>,
-    menu_channel_release: mpsc::Sender<()>,
     init_message: Option<String>,
 ) {
     tokio::spawn(async move {
@@ -99,12 +97,10 @@ fn input_loop(
                 }
             };
 
-            entry(shells.clone(), menu_channel_release.clone());
-
-            if !key.eq(&String::new()) {
-                if key.eq("l") {
-                    menu_channel_acquire.recv().await.unwrap();
-                }
+            let handle_opt = entry(shells.clone());
+            if handle_opt.is_some() {
+                let join_handle = handle_opt.unwrap();
+               join_handle.await.unwrap_or_default();
             }
         }
     });
@@ -133,7 +129,6 @@ async fn soc_is_shell(soc: &mut TcpStream, soc_key: String) -> bool {
 async fn handle_new_shell(
     mut soc: TcpStream,
     connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
-    menu_channel_release: mpsc::Sender<()>,
     skip_validation: Option<bool>,
 ) {
     let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
@@ -159,12 +154,7 @@ async fn handle_new_shell(
                         handle_to_soc_recv,
                         soc_kill_sig_recv,
                     );
-                    handle.handle_listen(
-                        handle_to_soc_send,
-                        soc_to_handle_recv,
-                        menu_channel_release,
-                        stdout,
-                    );
+                    handle.handle_listen(handle_to_soc_send, soc_to_handle_recv, stdout);
                     shells.insert(soc_key, handle);
                 } else {
                     return;
@@ -198,7 +188,6 @@ async fn main() {
         return;
     }
     let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-    let (menu_channel_release, menu_channel_acquire) = mpsc::channel::<()>(1024);
     let menu = menu_list::new();
 
     // get user input
@@ -207,25 +196,13 @@ async fn main() {
         red = color::Fg(color::LightRed),
         reset = color::Fg(color::Reset)
     );
-    input_loop(
-        connected_shells.clone(),
-        menu,
-        menu_channel_acquire,
-        menu_channel_release.clone(),
-        Some(init_message),
-    );
+    input_loop(connected_shells.clone(), menu, Some(init_message));
     let socket_stream = listener::catch_sockets(bound_addr, bound_port);
     pin_mut!(socket_stream);
 
     loop {
         let soc = socket_stream.next().await.unwrap().unwrap();
-        handle_new_shell(
-            soc,
-            connected_shells.clone(),
-            menu_channel_release.clone(),
-            None,
-        )
-        .await;
+        handle_new_shell(soc, connected_shells.clone(), None).await;
     }
 }
 
@@ -265,11 +242,9 @@ mod tests {
             let (soc, _) = listener.accept().await.unwrap();
             let connected_shells =
                 Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-            let (menu_channel_release, _) = mpsc::channel::<()>(1024);
             handle_new_shell(
                 soc,
                 connected_shells.clone(),
-                menu_channel_release,
                 Some(true),
             )
             .await;

@@ -95,12 +95,10 @@ impl Handle {
         &self,
         handle_to_soc_send: Sender<String>,
         mut soc_to_handle_recv: Receiver<String>,
-        menu_channel_release: Sender<()>,
         mut stdout: RawTerminal<W>,
     ) where
         W: Write + Send + 'static,
     {
-        let menu_channel_release_1 = menu_channel_release.clone();
         let tx = self.tx.clone();
         let rl = self.rl.clone();
         let tx_copy = self.tx.clone();
@@ -113,7 +111,7 @@ impl Handle {
 
             loop {
                 if !active {
-                    if listener::wait_for_signal(tx_copy.subscribe(), "start", &mut raw_mode)
+                    if listener::wait_for_signal(tx_copy.subscribe(), "start", Some(&mut raw_mode))
                         .await
                         .is_err()
                     {
@@ -139,7 +137,7 @@ impl Handle {
                             continue;
                         }
                     }
-                    _ = listener::wait_for_signal(tx_copy.subscribe(), "quit", &mut raw_mode) =>{
+                    _ = listener::wait_for_signal(tx_copy.subscribe(), "quit", Some(&mut raw_mode)) =>{
                         stdout.suspend_raw_mode().unwrap();
                         active = false;
                     }
@@ -159,7 +157,7 @@ impl Handle {
         // start writer
         tokio::spawn(async move {
             // wait for start signal
-            if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
+            if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
                 .await
                 .is_err()
             {
@@ -178,10 +176,9 @@ impl Handle {
                         println!("{clear}", clear = clear::BeforeCursor);
                         //notify the reader that we're pausing
                         tx.send("quit").unwrap();
-                        menu_channel_release_1.send(()).await.unwrap();
                         // send a new line so we get a prompt when we return
                         content = String::from("\n");
-                        if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
+                        if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
                             .await
                             .is_err()
                         {
@@ -203,8 +200,7 @@ impl Handle {
                             println!("{clear}", clear = clear::BeforeCursor);
                             tx.send("quit").unwrap();
                             raw_mode_tx.send(false).await.unwrap();
-                            menu_channel_release_1.send(()).await.unwrap();
-                            if listener::wait_for_signal(tx.subscribe(), "start", &mut raw_mode)
+                            if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
                                 .await
                                 .is_err()
                             {
@@ -304,7 +300,6 @@ mod tests {
         let (handle, cancel_token) = Handle::new();
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
         let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
-        let (menu_channel_release, _) = mpsc::channel::<()>(1024);
         let out = std::io::Cursor::new(Vec::new()).into_raw_mode().unwrap();
         listener::start_socket(
             stream,
@@ -315,7 +310,6 @@ mod tests {
         handle.handle_listen(
             handle_to_soc_send.clone(),
             soc_to_handle_recv.clone(),
-            menu_channel_release,
             out
         );
         let mut rx = handle.tx.subscribe();

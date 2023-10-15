@@ -25,14 +25,15 @@ pub fn catch_sockets(addr: String, port: u16) -> impl Stream<Item = io::Result<T
 pub async fn wait_for_signal(
     mut receiver: BroadcastReceiver<&str>,
     signal: &str,
-    raw_mode: &mut bool,
+    mut raw_mode_opt: Option<&mut bool>,
 ) -> Result<(), Error> {
     loop {
         match receiver.recv().await {
             Ok(val) => {
                 if val.eq(signal) {
                     break;
-                } else if val.eq("raw") {
+                } else if raw_mode_opt.is_some() && val.eq("raw") {
+                    let raw_mode = raw_mode_opt.take().unwrap();
                     *raw_mode = !*raw_mode;
                 } else if val.eq("delete") {
                     return Err(Error::new(ErrorKind::Interrupted, "Delete signal received"));

@@ -8,12 +8,13 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::{clear, color, cursor, terminal_size};
-use tokio::sync::{mpsc, Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::task::JoinHandle;
 
 use crate::socket::connection;
 
 pub type MenuListValue = Box<
-    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle>>>, mpsc::Sender<()>)
+    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle>>>) -> Option<JoinHandle<()>>
         + Send
         + Sync
         + 'static,
@@ -33,17 +34,11 @@ pub fn clear() {
 }
 
 pub fn exit() {
-    std::process::exit(0)
+    std::process::exit(0);
 }
 
-fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::Handle>>) {
-    let handle = match connected_shells.get(&key) {
-        Some(val) => {val},
-        None => {
-            println!("Invalid session key!");
-            return;
-        }
-    };
+/// Sends the satrt signal to a handle, await until the handle is paused
+async fn start(handle: connection::Handle) {
 
     //start handler
     let mut stdout = stdout();
@@ -66,6 +61,13 @@ fn start(key: String, connected_shells: &MutexGuard<HashMap<String, connection::
         .unwrap();
     }
     handle.tx.send("start").unwrap();
+
+    loop{
+        let sig = handle.tx.subscribe().recv().await.unwrap();
+        if sig == "quit"{
+            return;
+        }
+    }
 }
 
 fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>) {
@@ -150,18 +152,13 @@ fn alias(
 }
 
 macro_rules! unlock_menu {
-    ($menu_channel_release:expr) => {
+    () => {
         println!(
             "\r\n{show}{blink}{clear}",
             show = cursor::Show,
             blink = cursor::BlinkingBlock,
             clear = clear::AfterCursor
         );
-        let menu_esc_release = $menu_channel_release.clone();
-        tokio::spawn(async move {
-            menu_esc_release.send(()).await.unwrap();
-            return;
-        });
     };
 }
 
@@ -240,9 +237,8 @@ fn refresh_list_display(
 pub fn new() -> MenuList {
     let mut menu: MenuList = HashMap::new();
 
-    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
-                menu_channel_release: mpsc::Sender<()>| {
-        tokio::spawn(async move {
+    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>| -> Option<JoinHandle<()>> {
+        Some(tokio::spawn(async move {
             let stdin = stdin();
             let mut stdout = stdout().into_raw_mode().unwrap();
             let mut shell_list: Vec<(String, connection::Handle)>;
@@ -268,7 +264,7 @@ pub fn new() -> MenuList {
                     {
                         match key.unwrap() {
                             Key::Esc => {
-                                unlock_menu!(menu_channel_release);
+                                unlock_menu!();
                                 return;
                             }
                             Key::Up => {
@@ -283,12 +279,19 @@ pub fn new() -> MenuList {
                             }
                             Key::Char('\n') | Key::Char('\r') => {
                                 let key = keys[cur_idx].to_owned();
-                                start(key, &shells);
-                                println!(
-                                    "\r\n{show}{blink}",
-                                    show = cursor::Show,
-                                    blink = cursor::BlinkingBlock
-                                );
+                                let handle_opt = shells.get(&key);
+                                if handle_opt.is_some(){
+                                    let handle = handle_opt.unwrap().clone();
+                                    println!(
+                                        "\r\n{show}{blink}{clear}",
+                                        show = cursor::Show,
+                                        blink = cursor::BlinkingBlock,
+                                        clear = clear::AfterCursor
+                                    );
+                                    // drop the mutex guard so we're not holding and waiting
+                                    drop(shells);
+                                    start(handle).await;
+                                }
                                 return;
                             }
                             Key::Char('r') => {
@@ -311,7 +314,7 @@ pub fn new() -> MenuList {
                                 stdout.flush().unwrap();
 
                                 if shells.is_empty() {
-                                    unlock_menu!(menu_channel_release);
+                                    unlock_menu!();
                                     return;
                                 }
                             }
@@ -320,8 +323,7 @@ pub fn new() -> MenuList {
 
                                 alias(
                                     key,
-                                    (((start_pos + cur_idx as u16) as i16)
-                                        - (shells.len() as i16))
+                                    (((start_pos + cur_idx as u16) as i16) - (shells.len() as i16))
                                         as u16,
                                     &mut shells,
                                 );
@@ -337,20 +339,21 @@ pub fn new() -> MenuList {
                     refresh_list_display(&mut stdout, cur_idx, shell_list);
                 }
             }
-            unlock_menu!(menu_channel_release);
-        });
+            unlock_menu!();
+        }))
     };
     menu.insert("l", Box::new(list));
 
-    let clear = |_, _| {
+    let clear = |_| {
         clear();
+        None
     };
 
     menu.insert("clear", Box::new(clear));
 
-    menu.insert("h", Box::new(|_, _| help()));
+    menu.insert("h", Box::new(|_| {help(); None}));
 
-    menu.insert("exit", Box::new(|_, _| exit()));
+    menu.insert("exit", Box::new(|_| {exit(); None}));
 
     return menu;
 }
