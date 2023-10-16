@@ -6,8 +6,8 @@ use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{Config, Editor};
 use termion::clear;
-use termion::event::Key;
-use termion::input::TermRead;
+use termion::event::{Event, Key};
+use termion::input::TermReadEventsAndRaw;
 use termion::raw::RawTerminal;
 use tokio::select;
 use tokio::sync::broadcast::{self, Sender as HandleSender};
@@ -25,19 +25,20 @@ pub struct Handle {
     pub raw_mode: bool,
 }
 
-async fn handle_key_input() -> Option<Key> {
+async fn handle_key_input() -> Option<(Key, Vec<u8>)> {
     let (tx, mut rx) = mpsc::channel(1024);
     // stdin().keys() blocks the main thread so we have to spawn a new one and run it there
     task::spawn(async move {
-        let key_input = stdin().keys().next();
+        let key_input = stdin().events_and_raw().next();
         tx.send(key_input).await.unwrap();
     });
     let key_res = rx.recv().await.unwrap();
     return match key_res {
         Some(key) => {
             return match key {
-                Ok(val) => Some(val),
+                Ok((Event::Key(k), raw)) => Some((k, raw)),
                 Err(_) => None,
+                _ => None,
             };
         }
         None => None,
@@ -77,7 +78,7 @@ impl Handle {
         let soc_kill_token = CancellationToken::new();
         let soc_kill_token_listen = soc_kill_token.clone();
         let mut builder = Config::builder();
-        builder = builder.check_cursor_position(true);
+        builder = builder.check_cursor_position(false);
         let config = builder.build();
         let rl = Arc::new(Mutex::new(
             Editor::<(), FileHistory>::with_config(config).unwrap(),
@@ -190,89 +191,32 @@ impl Handle {
                     }
                 } else {
                     raw_mode_tx.send(true).await.unwrap();
-                    let inp_val = handle_key_input().await;
-                    if inp_val.is_none() {
+                    let input_opt = handle_key_input().await;
+                    if input_opt.is_none() {
                         continue;
                     }
-                    let key = inp_val.unwrap();
-                    match key {
-                        Key::Ctrl('b') => {
-                            println!("{clear}", clear = clear::BeforeCursor);
-                            tx.send("quit").unwrap();
-                            raw_mode_tx.send(false).await.unwrap();
-                            if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            if !raw_mode {
-                                continue;
-                            }
-                            raw_mode_tx.send(true).await.unwrap();
-                            handle_to_soc_send.send(String::from("\n")).await.unwrap()
+
+                    let (key_val, key_bytes) = input_opt.unwrap();
+                    if key_val == Key::Ctrl('b') {
+                        println!("{clear}", clear = clear::BeforeCursor);
+                        tx.send("quit").unwrap();
+                        raw_mode_tx.send(false).await.unwrap();
+                        if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
+                            .await
+                            .is_err()
+                        {
+                            return;
                         }
-                        Key::Esc => {
-                            handle_to_soc_send
-                                .send(String::from_utf8_lossy(&([0x1b] as [u8; 1])).into_owned())
-                                .await
-                                .unwrap();
+                        if !raw_mode {
+                            continue;
                         }
-                        Key::Delete | Key::Backspace => {
-                            handle_to_soc_send
-                                .send(String::from_utf8_lossy(&([0x7f] as [u8; 1])).into_owned())
-                                .await
-                                .unwrap();
-                        }
-                        Key::Char('\n') | Key::Char('\r') => {
-                            handle_to_soc_send
-                                .send(String::from_utf8_lossy(&([0x0d] as [u8; 1])).into_owned())
-                                .await
-                                .unwrap();
-                        }
-                        Key::Up | Key::Left | Key::Right | Key::Down => {
-                            let dir_key = match key {
-                                Key::Up => 0x41,
-                                Key::Left => 0x44,
-                                Key::Right => 0x43,
-                                Key::Down => 0x42,
-                                _ => continue,
-                            };
-                            handle_to_soc_send
-                                .send(
-                                    String::from_utf8_lossy(&([0x1b, 0x4f, dir_key] as [u8; 3]))
-                                        .into_owned(),
-                                )
-                                .await
-                                .unwrap();
-                        }
-                        Key::Alt(ch) => {
-                            handle_to_soc_send
-                                .send(
-                                    String::from_utf8_lossy(&([0x1b, ch as u8] as [u8; 2]))
-                                        .into_owned(),
-                                )
-                                .await
-                                .unwrap();
-                        }
-                        Key::Ctrl(ch) => {
-                            let low_ch = ch.to_ascii_lowercase();
-                            if low_ch as u8 > 96 {
-                                let ctrl_digit = low_ch as u8 - 96;
-                                handle_to_soc_send
-                                    .send(
-                                        String::from_utf8_lossy(&([ctrl_digit] as [u8; 1]))
-                                            .into_owned(),
-                                    )
-                                    .await
-                                    .unwrap();
-                            }
-                        }
-                        Key::Char(c) => {
-                            handle_to_soc_send.send(String::from(c)).await.unwrap();
-                        }
-                        _ => (),
+                        raw_mode_tx.send(true).await.unwrap();
+                        handle_to_soc_send.send(String::from("\n")).await.unwrap()
                     }
+                    handle_to_soc_send
+                        .send(String::from_utf8_lossy(&key_bytes).into_owned())
+                        .await
+                        .unwrap();
                 }
             }
         });
@@ -282,7 +226,10 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use termion::raw::IntoRawMode;
-    use tokio::{net::{TcpListener, TcpStream}, io::AsyncWriteExt};
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
 
     use super::*;
 
@@ -301,25 +248,15 @@ mod tests {
         let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
         let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
         let out = std::io::Cursor::new(Vec::new()).into_raw_mode().unwrap();
-        listener::start_socket(
-            stream,
-            soc_to_handle_send,
-            handle_to_soc_recv,
-            cancel_token,
-        );
-        handle.handle_listen(
-            handle_to_soc_send.clone(),
-            soc_to_handle_recv.clone(),
-            out
-        );
+        listener::start_socket(stream, soc_to_handle_send, handle_to_soc_recv, cancel_token);
+        handle.handle_listen(handle_to_soc_send.clone(), soc_to_handle_recv.clone(), out);
         let mut rx = handle.tx.subscribe();
 
         //test handle channel send/receive
-        tokio::spawn(async move{
+        tokio::spawn(async move {
             assert_eq!(rx.recv().await.unwrap(), "start");
         });
         handle.tx.send("start").unwrap();
-
 
         soc_to_handle_recv.clone().changed().await.unwrap();
         assert_eq!("mock value", soc_to_handle_recv.borrow().as_str());
