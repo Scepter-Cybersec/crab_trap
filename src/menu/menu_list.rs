@@ -1,6 +1,8 @@
 use std::cmp::max;
 use std::collections::HashMap;
 
+use rustyline::history::MemHistory;
+use rustyline::{Config, Editor};
 use std::io::{stdin, stdout, Stdout, Write};
 use std::sync::Arc;
 use termion::cursor::DetectCursorPos;
@@ -8,19 +10,23 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::{clear, color, cursor, terminal_size};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::sync::{oneshot, Mutex, MutexGuard, watch, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::input::input;
 use crate::socket::connection;
 
-pub type MenuListValue = Box<
-    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle>>>) -> Option<JoinHandle<()>>
+pub type MenuListValue<B> = Box<
+    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle<B>>>>) -> Option<JoinHandle<()>>
         + Send
         + Sync
         + 'static,
 >;
 
-pub type MenuList = HashMap<&'static str, MenuListValue>;
+pub type MenuList<B> = HashMap<&'static str, MenuListValue<B>>;
 
 pub fn help() {
     println!("l - list the connected shells");
@@ -38,10 +44,16 @@ pub fn exit() {
 }
 
 /// Sends the satrt signal to a handle, await until the handle is paused
-async fn start(handle: connection::Handle) {
-
+async fn start<B>(handle: connection::Handle<B>)
+where
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     //start handler
     let mut stdout = stdout();
+    let mut read_buf: [u8; 4096] = [0; 4096];
+    let mut soc = handle.stream.lock().await;
+    let (tx, mut rx) = mpsc::channel::<String>(1024);
+    let (raw_tx, mut raw_rx) = mpsc::channel::<Option<(Key, Vec<u8>)>>(1024);
     write!(stdout, "{clear}", clear = clear::BeforeCursor).unwrap();
     if handle.raw_mode {
         write!(
@@ -51,6 +63,28 @@ async fn start(handle: connection::Handle) {
             reset = color::Fg(color::Reset)
         )
         .unwrap();
+
+        let mut raw_stdout = stdout.into_raw_mode().unwrap();
+
+        loop {
+            let read_future = soc.read(&mut read_buf);
+            input::handle_key_input(raw_tx.clone()).await;
+            let input_future = raw_rx.recv();
+            select! {
+                Ok(res) = read_future =>{
+                    raw_stdout.write_all(&read_buf[0..res]).unwrap();
+                    raw_stdout.flush().unwrap();
+                }
+                Some(Some((key, key_bytes))) = input_future =>{
+                    if key == Key::Ctrl('b'){
+                        raw_stdout.suspend_raw_mode().unwrap();
+                        return
+                    }
+                    soc.write_all(&key_bytes).await.unwrap();
+                    soc.flush().await.unwrap();
+                }
+            };
+        }
     } else {
         write!(
             stdout,
@@ -59,18 +93,52 @@ async fn start(handle: connection::Handle) {
             reset = color::Fg(color::Reset)
         )
         .unwrap();
-    }
-    handle.tx.send("start").unwrap();
 
-    loop{
-        let sig = handle.tx.subscribe().recv().await.unwrap();
-        if sig == "quit"{
-            return;
+        let history = MemHistory::new();
+        let mut builder = Config::builder();
+        builder = builder.check_cursor_position(false);
+        let config = builder.build();
+
+        let rl = Arc::new(Mutex::new(Editor::with_history(config, history).unwrap()));
+
+        loop {
+            let read_future = soc.read(&mut read_buf);
+            
+            input::read_line(rl.clone(), tx.clone(), None).await;
+            let input_future = rx.recv();
+            select! {
+                res = read_future =>{
+                    if res.is_err(){
+                        println!("{}", res.err().unwrap());
+                        break;
+                    }
+                    let n = res.unwrap();
+                    stdout.write_all(&read_buf[0..n]).unwrap();
+                    stdout.flush().unwrap();
+                }
+                res = input_future =>{
+                    if res.is_none(){
+                        println!("receiving input failed");
+                        break;
+                    }
+                    let inp_string = res.unwrap();
+                    if inp_string.trim_end() == "back"{
+                        break;
+                    }
+                    soc.write_all(inp_string.as_bytes()).await.unwrap();
+                    soc.flush().await.unwrap();
+                }
+            };
         }
     }
 }
 
-fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>) {
+async fn delete<'a, B>(
+    key: String,
+    connected_shells: &'a mut MutexGuard<'_, HashMap<String, connection::Handle<B>>>,
+) where
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let handle = match connected_shells.remove(&key) {
         Some(val) => val,
         None => {
@@ -78,16 +146,16 @@ fn delete(key: String, connected_shells: &mut MutexGuard<HashMap<String, connect
             return;
         }
     };
-    //delete handler
-    handle.tx.send("delete").unwrap();
-    handle.soc_kill_token.cancel();
+    handle.stream.lock().await.flush().await.unwrap();
 }
 
-fn alias(
+fn alias<B>(
     shell_key: String,
     selected_index: u16,
-    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>,
-) {
+    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle<B>>>,
+) where
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let mut stdout = stdout();
     macro_rules! reset_alias_line {
         ($stdout:expr, $prompt:expr $(, $input:expr)?) => {
@@ -188,11 +256,13 @@ fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
     }
 }
 
-fn refresh_list_display(
+fn refresh_list_display<B>(
     stdout: &mut RawTerminal<Stdout>,
     cur_idx: usize,
-    keys: Vec<(String, connection::Handle)>,
-) {
+    keys: Vec<(String, connection::Handle<B>)>,
+) where
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     write!(
         stdout,
         "{goto}{clear}{clear_before}",
@@ -234,21 +304,21 @@ fn refresh_list_display(
     list_menu_help(stdout);
 }
 
-pub fn new() -> MenuList {
-    let mut menu: MenuList = HashMap::new();
+pub fn new() -> MenuList<TcpStream> {
+    let mut menu: MenuList<TcpStream> = HashMap::new();
 
-    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>| -> Option<JoinHandle<()>> {
+    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle<TcpStream>>>>| -> Option<JoinHandle<()>> {
         Some(tokio::spawn(async move {
             let stdin = stdin();
             let mut stdout = stdout().into_raw_mode().unwrap();
-            let mut shell_list: Vec<(String, connection::Handle)>;
+            let mut shell_list: Vec<(String, connection::Handle<TcpStream>)>;
             {
                 shell_list = connected_shells
                     .lock()
                     .await
                     .iter()
                     .map(|item| (item.0.to_owned(), item.1.to_owned()))
-                    .collect::<Vec<(String, connection::Handle)>>()
+                    .collect::<Vec<(String, connection::Handle<TcpStream>)>>()
             }
             if shell_list.len() > 0 {
                 let (_, start_pos) = stdout.cursor_pos().unwrap();
@@ -289,7 +359,8 @@ pub fn new() -> MenuList {
                                         clear = clear::AfterCursor
                                     );
                                     // drop the mutex guard so we're not holding and waiting
-                                    drop(shells);
+                                    // drop(shells);
+                                    stdout.suspend_raw_mode().unwrap();
                                     start(handle).await;
                                 }
                                 return;
@@ -302,11 +373,10 @@ pub fn new() -> MenuList {
                                     None => return,
                                 };
                                 handle.raw_mode = !handle.raw_mode;
-                                handle.tx.send("raw").unwrap();
                             }
                             Key::Delete | Key::Backspace => {
                                 let key: String = keys[cur_idx].to_owned();
-                                delete(key, &mut shells);
+                                delete(key, &mut shells).await;
                                 if cur_idx > 0 {
                                     cur_idx -= 1;
                                 }
@@ -351,9 +421,21 @@ pub fn new() -> MenuList {
 
     menu.insert("clear", Box::new(clear));
 
-    menu.insert("h", Box::new(|_| {help(); None}));
+    menu.insert(
+        "h",
+        Box::new(|_| {
+            help();
+            None
+        }),
+    );
 
-    menu.insert("exit", Box::new(|_| {exit(); None}));
+    menu.insert(
+        "exit",
+        Box::new(|_| {
+            exit();
+            None
+        }),
+    );
 
     return menu;
 }
