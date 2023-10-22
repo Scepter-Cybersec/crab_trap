@@ -10,23 +10,23 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::{clear, color, cursor, terminal_size};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::select;
-use tokio::sync::{oneshot, Mutex, MutexGuard, watch, mpsc};
+use tokio::io::{ AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
+use tokio::{join, select};
+use tokio_util::sync::CancellationToken;
 
 use crate::input::input;
 use crate::socket::connection;
 
-pub type MenuListValue<B> = Box<
-    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle<B>>>>) -> Option<JoinHandle<()>>
+pub type MenuListValue = Box<
+    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle>>>) -> Option<JoinHandle<()>>
         + Send
         + Sync
         + 'static,
 >;
 
-pub type MenuList<B> = HashMap<&'static str, MenuListValue<B>>;
+pub type MenuList = HashMap<&'static str, MenuListValue>;
 
 pub fn help() {
     println!("l - list the connected shells");
@@ -44,101 +44,122 @@ pub fn exit() {
 }
 
 /// Sends the satrt signal to a handle, await until the handle is paused
-async fn start<B>(handle: connection::Handle<B>)
-where
-    B: AsyncRead + AsyncWrite + Unpin,
-{
+async fn start(handle: connection::Handle) {
     //start handler
-    let mut stdout = stdout();
     let mut read_buf: [u8; 4096] = [0; 4096];
-    let mut soc = handle.stream.lock().await;
-    let (tx, mut rx) = mpsc::channel::<String>(1024);
-    let (raw_tx, mut raw_rx) = mpsc::channel::<Option<(Key, Vec<u8>)>>(1024);
-    write!(stdout, "{clear}", clear = clear::BeforeCursor).unwrap();
-    if handle.raw_mode {
-        write!(
-            stdout,
-            "\r\n{guide}type \"CTRL + b\" to return to menu{reset}\r\n",
-            guide = color::Fg(color::Red),
-            reset = color::Fg(color::Reset)
-        )
-        .unwrap();
+    let mut write_soc = handle.write_stream.lock().await;
+    let mut read_soc = handle.read_stream.lock().await;
+    println!("{clear}", clear = clear::BeforeCursor);
 
-        let mut raw_stdout = stdout.into_raw_mode().unwrap();
+    let quit_token = CancellationToken::new();
+    let quit_token_write = quit_token.clone();
 
+    // start reader thread
+    let reader_handle = async move {
+        let mut out = stdout();
+        match handle.raw_mode {
+            true => {
+                println!(
+                    "\r\n{guide}type \"CTRL + b\" to return to menu{reset}\r\n",
+                    guide = color::Fg(color::Red),
+                    reset = color::Fg(color::Reset)
+                );
+            }
+            false => {
+                println!(
+                    "\r\n{guide}type \"back\" to return to menu{reset}\r\n",
+                    guide = color::Fg(color::Red),
+                    reset = color::Fg(color::Reset)
+                );
+            }
+        }
         loop {
-            let read_future = soc.read(&mut read_buf);
-            input::handle_key_input(raw_tx.clone()).await;
-            let input_future = raw_rx.recv();
+            let reader = read_soc.read(&mut read_buf);
+            let cancel_fut = quit_token.cancelled();
             select! {
-                Ok(res) = read_future =>{
-                    raw_stdout.write_all(&read_buf[0..res]).unwrap();
-                    raw_stdout.flush().unwrap();
-                }
-                Some(Some((key, key_bytes))) = input_future =>{
-                    if key == Key::Ctrl('b'){
-                        raw_stdout.suspend_raw_mode().unwrap();
+                bytes_read = reader => {
+                    if bytes_read.is_err(){
+                        eprint!("Channel closed");
+                        quit_token.cancel();
                         return
                     }
-                    soc.write_all(&key_bytes).await.unwrap();
-                    soc.flush().await.unwrap();
+                    let n = bytes_read.unwrap();
+                    out.write_all(&mut read_buf[0..n]).unwrap();
+                    out.flush().unwrap();
                 }
-            };
+                _ = cancel_fut =>{
+                    break;
+                }
+            }
         }
-    } else {
-        write!(
-            stdout,
-            "\r\n{guide}type \"back\" to return to menu{reset}\r\n",
-            guide = color::Fg(color::Red),
-            reset = color::Fg(color::Reset)
-        )
-        .unwrap();
+    };
 
+    // start write to socket thread
+    let writer_handle = async move {
         let history = MemHistory::new();
         let mut builder = Config::builder();
         builder = builder.check_cursor_position(false);
         let config = builder.build();
 
-        let rl = Arc::new(Mutex::new(Editor::with_history(config, history).unwrap()));
-
+        let rl = Arc::new(Mutex::new(
+            Editor::<(), MemHistory>::with_history(config, history).unwrap(),
+        ));
         loop {
-            let read_future = soc.read(&mut read_buf);
-            
-            input::read_line(rl.clone(), tx.clone(), None).await;
-            let input_future = rx.recv();
-            select! {
-                res = read_future =>{
-                    if res.is_err(){
-                        println!("{}", res.err().unwrap());
-                        break;
-                    }
-                    let n = res.unwrap();
-                    stdout.write_all(&read_buf[0..n]).unwrap();
-                    stdout.flush().unwrap();
+           
+            if handle.raw_mode {
+                let out = stdout();
+                let raw_stdout = out.into_raw_mode().unwrap();
+
+                loop {
+                    let cancel_fut = quit_token_write.cancelled();
+                    let input_future = input::handle_key_input();
+                    select! {
+                        Ok(Some((key, key_bytes))) = input_future =>{
+                            if key == Key::Ctrl('b'){
+                                raw_stdout.suspend_raw_mode().unwrap();
+                                quit_token_write.cancel();
+                                return
+                            }
+                            write_soc.write_all(&key_bytes).await.unwrap();
+                            write_soc.flush().await.unwrap();
+                        }
+                        _ = cancel_fut =>{
+                            break;
+                        }
+                    };
                 }
-                res = input_future =>{
-                    if res.is_none(){
-                        println!("receiving input failed");
+            } else {
+                let cancel_fut = quit_token_write.cancelled();
+                let input_future = input::read_line(rl.clone(), None);
+                select! {
+                    res = input_future =>{
+                        if res.is_err(){
+                            println!("receiving input failed");
+                            quit_token_write.cancel();
+                            break;
+                        }
+                        let inp_string = res.unwrap();
+                        if inp_string.trim_end() == "back"{
+                            quit_token_write.cancel();
+                            break;
+                        }
+                        write_soc.write_all(inp_string.as_bytes()).await.unwrap();
+                        write_soc.flush().await.unwrap();
+                    }
+                    _ = cancel_fut =>{
                         break;
                     }
-                    let inp_string = res.unwrap();
-                    if inp_string.trim_end() == "back"{
-                        break;
-                    }
-                    soc.write_all(inp_string.as_bytes()).await.unwrap();
-                    soc.flush().await.unwrap();
                 }
-            };
+            }
         }
-    }
+    };
+    join!(reader_handle, writer_handle);
 }
 
-async fn delete<'a, B>(
+async fn delete(
     key: String,
-    connected_shells: &'a mut MutexGuard<'_, HashMap<String, connection::Handle<B>>>,
-) where
-    B: AsyncRead + AsyncWrite + Unpin,
-{
+    connected_shells: &mut MutexGuard<'_, HashMap<String, connection::Handle>>,
+) {
     let handle = match connected_shells.remove(&key) {
         Some(val) => val,
         None => {
@@ -146,16 +167,14 @@ async fn delete<'a, B>(
             return;
         }
     };
-    handle.stream.lock().await.flush().await.unwrap();
+    handle.write_stream.lock().await.flush().await.unwrap();
 }
 
-fn alias<B>(
+fn alias(
     shell_key: String,
     selected_index: u16,
-    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle<B>>>,
-) where
-    B: AsyncRead + AsyncWrite + Unpin,
-{
+    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>,
+) {
     let mut stdout = stdout();
     macro_rules! reset_alias_line {
         ($stdout:expr, $prompt:expr $(, $input:expr)?) => {
@@ -256,13 +275,11 @@ fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
     }
 }
 
-fn refresh_list_display<B>(
+fn refresh_list_display(
     stdout: &mut RawTerminal<Stdout>,
     cur_idx: usize,
-    keys: Vec<(String, connection::Handle<B>)>,
-) where
-    B: AsyncRead + AsyncWrite + Unpin,
-{
+    keys: Vec<(String, connection::Handle)>,
+) {
     write!(
         stdout,
         "{goto}{clear}{clear_before}",
@@ -304,21 +321,21 @@ fn refresh_list_display<B>(
     list_menu_help(stdout);
 }
 
-pub fn new() -> MenuList<TcpStream> {
-    let mut menu: MenuList<TcpStream> = HashMap::new();
+pub fn new() -> MenuList {
+    let mut menu: MenuList = HashMap::new();
 
-    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle<TcpStream>>>>| -> Option<JoinHandle<()>> {
+    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>| -> Option<JoinHandle<()>> {
         Some(tokio::spawn(async move {
             let stdin = stdin();
             let mut stdout = stdout().into_raw_mode().unwrap();
-            let mut shell_list: Vec<(String, connection::Handle<TcpStream>)>;
+            let mut shell_list: Vec<(String, connection::Handle)>;
             {
                 shell_list = connected_shells
                     .lock()
                     .await
                     .iter()
                     .map(|item| (item.0.to_owned(), item.1.to_owned()))
-                    .collect::<Vec<(String, connection::Handle<TcpStream>)>>()
+                    .collect::<Vec<(String, connection::Handle)>>()
             }
             if shell_list.len() > 0 {
                 let (_, start_pos) = stdout.cursor_pos().unwrap();

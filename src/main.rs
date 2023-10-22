@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use menu::menu_list::clear;
 use rustyline::DefaultEditor;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use std::process::Command;
 use termion::raw::IntoRawMode;
 use tokio::io::AsyncWriteExt;
@@ -20,9 +21,9 @@ use std::io::stdout;
 use termion::{self, color};
 use tokio::sync::Mutex;
 
+mod input;
 mod menu;
 mod socket;
-mod input;
 
 fn get_prompt() -> (String, String) {
     let mut pwd = match env::current_dir() {
@@ -43,8 +44,8 @@ fn get_prompt() -> (String, String) {
 }
 
 fn input_loop(
-    shells: Arc<Mutex<HashMap<String, connection::Handle<TcpStream>>>>,
-    menu: menu_list::MenuList<TcpStream>,
+    shells: Arc<Mutex<HashMap<String, connection::Handle>>>,
+    menu: menu_list::MenuList,
     init_message: Option<String>,
 ) {
     tokio::spawn(async move {
@@ -101,25 +102,26 @@ fn input_loop(
             let handle_opt = entry(shells.clone());
             if handle_opt.is_some() {
                 let join_handle = handle_opt.unwrap();
-               join_handle.await.unwrap_or_default();
+                join_handle.await.unwrap_or_default();
             }
         }
     });
 }
 
-async fn soc_is_shell(stream: Arc<Mutex<TcpStream>>, soc_key: String) -> bool {
-    let mut soc = stream.lock().await;
-    soc.write(format!("echo {}\r\n", soc_key).as_bytes())
+async fn soc_is_shell(read_stream: Arc<Mutex<OwnedReadHalf>>, write_stream:Arc<Mutex<OwnedWriteHalf>>, soc_key: String) -> bool {
+    let read_soc = read_stream.lock().await;
+    let mut write_soc = write_stream.lock().await;
+    write_soc.write(format!("echo {}\r\n", soc_key).as_bytes())
         .await
         .unwrap();
     let mut buf: [u8; 4096] = [0; 4096];
     for _ in 0..10 {
-        let len = soc.try_read(&mut buf);
+        let len = read_soc.try_read(&mut buf);
         if len.is_ok() {
             let content: String = String::from_utf8_lossy(&buf[..len.unwrap()]).into();
             if content.contains(&soc_key) {
                 // add a new line so we get our prompt back, also check to make sure the socket did not just close
-                soc.write("\n".as_bytes()).await.unwrap_or_default();
+                write_soc.write("\n".as_bytes()).await.unwrap_or_default();
                 return true;
             }
         }
@@ -130,11 +132,14 @@ async fn soc_is_shell(stream: Arc<Mutex<TcpStream>>, soc_key: String) -> bool {
 
 async fn handle_new_shell(
     soc: TcpStream,
-    connected_shells: Arc<Mutex<HashMap<String, connection::Handle<TcpStream>>>>,
+    connected_shells: Arc<
+        Mutex<HashMap<String, connection::Handle>>,
+    >,
     skip_validation: Option<bool>,
 ) {
     let soc_addr = soc.peer_addr();
-    let handle = connection::Handle::new(soc);
+    let (soc_read, soc_write) = soc.into_split();
+    let handle = connection::Handle::new(soc_read, soc_write);
 
     tokio::spawn(async move {
         let soc_key: String;
@@ -143,7 +148,7 @@ async fn handle_new_shell(
                 soc_key = digest(val.to_string())[0..31].to_string();
                 let is_shell = match skip_validation {
                     Some(true) => true,
-                    _ => soc_is_shell(handle.stream.clone(), soc_key.clone()).await,
+                    _ => soc_is_shell(handle.read_stream.clone(), handle.write_stream.clone(), soc_key.clone()).await,
                 };
                 if is_shell {
                     let mut shells = connected_shells.lock().await;
@@ -179,7 +184,9 @@ async fn main() {
         println!("Usage: {0} OR {0} <address> <port>", args[0]);
         return;
     }
-    let connected_shells = Arc::new(Mutex::new(HashMap::<String, connection::Handle<TcpStream>>::new()));
+    let connected_shells = Arc::new(Mutex::new(
+        HashMap::<String, connection::Handle>::new(),
+    ));
     let menu = menu_list::new();
 
     // get user input
@@ -202,6 +209,8 @@ async fn main() {
 mod tests {
     // use tokio::net::TcpListener;
 
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -214,34 +223,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_soc_is_shell() {
-        // let listener_res = TcpListener::bind("127.0.0.1:32423").await;
-        // assert!(listener_res.is_ok());
-        // let listener = listener_res.unwrap();
-        // tokio::spawn(async move {
-        //     let (mut soc, _) = listener.accept().await.unwrap();
-        //     soc.write("test123\n".as_bytes()).await.unwrap();
-        // });
-        // let mut stream = TcpStream::connect("127.0.0.1:32423").await.unwrap();
-        // assert!(soc_is_shell(&mut stream, String::from("test123")).await);
+        let listener_res = TcpListener::bind("127.0.0.1:32423").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        tokio::spawn(async move {
+            let (mut soc, _) = listener.accept().await.unwrap();
+            soc.write("test123\n".as_bytes()).await.unwrap();
+        });
+        let (read, write) = TcpStream::connect("127.0.0.1:32423").await.unwrap().into_split();
+        let read_half = Arc::new(Mutex::new(read));
+        let write_half = Arc::new(Mutex::new(write));
+        assert!(soc_is_shell(read_half, write_half, String::from("test123")).await);
     }
 
     #[tokio::test]
     async fn test_handle_new_shell() {
-        // let listener_res = TcpListener::bind("127.0.0.1:32424").await;
-        // assert!(listener_res.is_ok());
-        // let listener = listener_res.unwrap();
-        // tokio::spawn(async move {
-        //     let (soc, _) = listener.accept().await.unwrap();
-        //     let connected_shells =
-        //         Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
-        //     handle_new_shell(
-        //         soc,
-        //         connected_shells.clone(),
-        //         Some(true),
-        //     )
-        //     .await;
-        //     assert!(connected_shells.lock().await.len() > 0);
-        // });
-        // TcpStream::connect("127.0.0.1:32424").await.unwrap();
+        let listener_res = TcpListener::bind("127.0.0.1:32424").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        tokio::spawn(async move {
+            let (soc, _) = listener.accept().await.unwrap();
+            let connected_shells =
+                Arc::new(Mutex::new(HashMap::<String, connection::Handle>::new()));
+            handle_new_shell(
+                soc,
+                connected_shells.clone(),
+                Some(true),
+            )
+            .await;
+            assert!(connected_shells.lock().await.len() > 0);
+        });
+        TcpStream::connect("127.0.0.1:32424").await.unwrap();
     }
 }

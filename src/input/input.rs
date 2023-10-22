@@ -1,59 +1,43 @@
 use std::{io::stdin, sync::Arc};
 
-use futures_util::FutureExt;
-use rustyline::{error::ReadlineError, history::MemHistory, Editor};
+use rustyline::{history::MemHistory, Editor};
 use termion::{
     event::{Event, Key},
     input::TermReadEventsAndRaw,
 };
 use tokio::{
     sync::{
-        mpsc::{self, Sender},
-        Mutex,
+        oneshot::{self, error::RecvError}, Mutex,
     },
     task,
 };
 
 pub async fn read_line(
     rl: Arc<Mutex<Editor<(), MemHistory>>>,
-    tx: Sender<String>,
     prompt: Option<&str>,
-) {
+) -> Result<String, RecvError> {
+    let (tx, rx) = oneshot::channel::<String>();
     let input_prompt = match prompt {
-        Some(val) => String::from(val),
-        None => String::from(""),
+        Some(s) => String::from(s),
+        None => String::new(),
     };
-    let tx_copy = tx.clone();
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut reader = rl.lock().await;
-        if tx_copy.is_closed() {
-            return;
-        }
+
         let raw_content = reader.readline(&input_prompt);
 
         let content = match raw_content {
             Ok(line) => line + "\n",
             Err(_) => String::from(""),
         };
-        tx_copy
-            .clone()
-            .send(content)
-            .await
-            .unwrap_or_else(|err| eprintln!("{err}"));
+        tx.send(content)
+            .unwrap_or_else(|err| eprintln!("Error from readline handler: {err}"));
     });
-    tokio::spawn(async move {
-        tx.closed()
-            .then(|()| async move {
-                handle.abort();
-            })
-            .await;
-    });
+    rx.await
 }
 
-pub async fn handle_key_input(tx: Sender<Option<(Key, Vec<u8>)>>) {
-    if tx.is_closed() {
-        return;
-    }
+pub async fn handle_key_input() -> Result<Option<(Key, Vec<u8>)>, RecvError>{
+    let (tx, rx) = oneshot::channel::<Option<(Key, Vec<u8>)>>();
     task::spawn(async move {
         let key_input = stdin().events_and_raw().next();
         let cleaned = match key_input {
@@ -65,8 +49,7 @@ pub async fn handle_key_input(tx: Sender<Option<(Key, Vec<u8>)>>) {
 
             None => None,
         };
-        tx.send(cleaned)
-            .await
-            .unwrap_or_else(|err| eprintln!("{err}"));
+        tx.send(cleaned).unwrap_or_else(|_| eprintln!("Error from raw readline handler"));
     });
+    rx.await
 }
