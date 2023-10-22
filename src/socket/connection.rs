@@ -30,8 +30,3 @@ impl Clone for Handle {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    
-}

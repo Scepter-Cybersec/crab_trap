@@ -10,7 +10,7 @@ use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::{clear, color, cursor, terminal_size};
-use tokio::io::{ AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio::{join, select};
@@ -105,29 +105,26 @@ async fn start(handle: connection::Handle) {
             Editor::<(), MemHistory>::with_history(config, history).unwrap(),
         ));
         loop {
-           
             if handle.raw_mode {
                 let out = stdout();
                 let raw_stdout = out.into_raw_mode().unwrap();
 
-                loop {
-                    let cancel_fut = quit_token_write.cancelled();
-                    let input_future = input::handle_key_input();
-                    select! {
-                        Ok(Some((key, key_bytes))) = input_future =>{
-                            if key == Key::Ctrl('b'){
-                                raw_stdout.suspend_raw_mode().unwrap();
-                                quit_token_write.cancel();
-                                return
-                            }
-                            write_soc.write_all(&key_bytes).await.unwrap();
-                            write_soc.flush().await.unwrap();
+                let cancel_fut = quit_token_write.cancelled();
+                let input_future = input::handle_key_input();
+                select! {
+                    Ok(Some((key, key_bytes))) = input_future =>{
+                        if key == Key::Ctrl('b'){
+                            raw_stdout.suspend_raw_mode().unwrap();
+                            quit_token_write.cancel();
+                            return
                         }
-                        _ = cancel_fut =>{
-                            break;
-                        }
-                    };
-                }
+                        write_soc.write_all(&key_bytes).await.unwrap();
+                        write_soc.flush().await.unwrap();
+                    }
+                    _ = cancel_fut =>{
+                        break;
+                    }
+                };
             } else {
                 let cancel_fut = quit_token_write.cancelled();
                 let input_future = input::read_line(rl.clone(), None);
