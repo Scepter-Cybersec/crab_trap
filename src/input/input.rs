@@ -7,7 +7,8 @@ use termion::{
 };
 use tokio::{
     sync::{
-        oneshot::{self, error::RecvError}, Mutex,
+        oneshot::{self, error::RecvError},
+        Mutex,
     },
     task,
 };
@@ -27,16 +28,17 @@ pub async fn read_line(
         let raw_content = reader.readline(&input_prompt);
 
         let content = match raw_content {
-            Ok(line) => line + "\n",
+            Ok(line) => line,
             Err(_) => String::from(""),
         };
-        tx.send(content)
+        reader.add_history_entry(content.clone()).unwrap();
+        tx.send(content + "\n")
             .unwrap_or_else(|err| eprintln!("Error from readline handler: {err}"));
     });
     rx.await
 }
 
-pub async fn handle_key_input() -> Result<Option<(Key, Vec<u8>)>, RecvError>{
+pub async fn handle_key_input() -> Result<Option<(Key, Vec<u8>)>, RecvError> {
     let (tx, rx) = oneshot::channel::<Option<(Key, Vec<u8>)>>();
     task::spawn(async move {
         let key_input = stdin().events_and_raw().next();
@@ -49,7 +51,8 @@ pub async fn handle_key_input() -> Result<Option<(Key, Vec<u8>)>, RecvError>{
 
             None => None,
         };
-        tx.send(cleaned).unwrap_or_else(|_| eprintln!("Error from raw readline handler"));
+        tx.send(cleaned)
+            .unwrap_or_else(|_| eprintln!("Error from raw readline handler"));
     });
     rx.await
 }

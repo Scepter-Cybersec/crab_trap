@@ -1,8 +1,7 @@
 use std::cmp::max;
 use std::collections::HashMap;
 
-use rustyline::history::MemHistory;
-use rustyline::{Config, Editor};
+use connection::Handle;
 use std::io::{stdin, stdout, Stdout, Write};
 use std::sync::Arc;
 use termion::cursor::DetectCursorPos;
@@ -20,10 +19,7 @@ use crate::input::input;
 use crate::socket::connection;
 
 pub type MenuListValue = Box<
-    dyn Fn(Arc<Mutex<HashMap<String, connection::Handle>>>) -> Option<JoinHandle<()>>
-        + Send
-        + Sync
-        + 'static,
+    dyn Fn(Arc<Mutex<HashMap<String, Handle>>>) -> Option<JoinHandle<()>> + Send + Sync + 'static,
 >;
 
 pub type MenuList = HashMap<&'static str, MenuListValue>;
@@ -43,120 +39,114 @@ pub fn exit() {
     std::process::exit(0);
 }
 
-/// Sends the satrt signal to a handle, await until the handle is paused
-async fn start(handle: connection::Handle) {
-    //start handler
-    let mut read_buf: [u8; 4096] = [0; 4096];
-    let mut write_soc = handle.write_stream.lock().await;
+async fn soc_read<W>(handle: Handle, mut out_writer: W, cancel_token: CancellationToken)
+where
+    W: Write,
+{
     let mut read_soc = handle.read_stream.lock().await;
-    println!("{clear}", clear = clear::BeforeCursor);
-
-    let quit_token = CancellationToken::new();
-    let quit_token_write = quit_token.clone();
-
-    // start reader thread
-    let reader_handle = async move {
-        let mut out = stdout();
-        match handle.raw_mode {
-            true => {
-                println!(
-                    "\r\n{guide}type \"CTRL + b\" to return to menu{reset}\r\n",
-                    guide = color::Fg(color::Red),
-                    reset = color::Fg(color::Reset)
-                );
+    let mut read_buf: [u8; 4096] = [0; 4096];
+    loop {
+        let reader = read_soc.read(&mut read_buf);
+        let cancel_fut = cancel_token.cancelled();
+        select! {
+            bytes_read = reader => {
+                if bytes_read.is_err(){
+                    eprint!("Channel closed");
+                    cancel_token.cancel();
+                    return
+                }
+                let n = bytes_read.unwrap();
+                out_writer.write_all(&mut read_buf[0..n]).unwrap();
+                out_writer.flush().unwrap();
             }
-            false => {
-                println!(
-                    "\r\n{guide}type \"back\" to return to menu{reset}\r\n",
-                    guide = color::Fg(color::Red),
-                    reset = color::Fg(color::Reset)
-                );
+            _ = cancel_fut =>{
+                break;
             }
         }
-        loop {
-            let reader = read_soc.read(&mut read_buf);
-            let cancel_fut = quit_token.cancelled();
+    }
+}
+
+async fn soc_write(handle: Handle, cancel_token: CancellationToken) {
+    let mut write_soc = handle.write_stream.lock().await;
+    loop {
+        if handle.raw_mode {
+            let out = stdout();
+            let raw_stdout = out.into_raw_mode().unwrap();
+
+            let cancel_fut = cancel_token.cancelled();
+            let input_future = input::handle_key_input();
             select! {
-                bytes_read = reader => {
-                    if bytes_read.is_err(){
-                        eprint!("Channel closed");
-                        quit_token.cancel();
+                Ok(Some((key, key_bytes))) = input_future =>{
+                    if key == Key::Ctrl('b'){
+                        raw_stdout.suspend_raw_mode().unwrap();
+                        cancel_token.cancel();
                         return
                     }
-                    let n = bytes_read.unwrap();
-                    out.write_all(&mut read_buf[0..n]).unwrap();
-                    out.flush().unwrap();
+                    write_soc.write_all(&key_bytes).await.unwrap();
+                    write_soc.flush().await.unwrap();
+                }
+                _ = cancel_fut =>{
+                    break;
+                }
+            };
+        } else {
+            let cancel_fut = cancel_token.cancelled();
+            let input_future = input::read_line(handle.readline.clone(), None);
+            select! {
+                res = input_future =>{
+                    if res.is_err(){
+                        println!("receiving input failed");
+                        cancel_token.cancel();
+                        break;
+                    }
+                    let inp_string = res.unwrap();
+                    if inp_string.trim_end() == "back"{
+                        cancel_token.cancel();
+                        break;
+                    }
+                    write_soc.write_all(inp_string.as_bytes()).await.unwrap();
+                    write_soc.flush().await.unwrap();
                 }
                 _ = cancel_fut =>{
                     break;
                 }
             }
         }
-    };
+    }
+}
+
+/// Sends the start signal to a handle, await until the handle is paused
+async fn start(handle: Handle) {
+    //start handler
+    println!("{clear}", clear = clear::BeforeCursor);
+
+    let quit_token = CancellationToken::new();
+
+    match handle.raw_mode {
+        true => {
+            println!(
+                "\r\n{guide}type \"CTRL + b\" to return to menu{reset}\r\n",
+                guide = color::Fg(color::Red),
+                reset = color::Fg(color::Reset)
+            );
+        }
+        false => {
+            println!(
+                "\r\n{guide}type \"back\" to return to menu{reset}\r\n",
+                guide = color::Fg(color::Red),
+                reset = color::Fg(color::Reset)
+            );
+        }
+    }
+
+    let reader_handle = soc_read(handle.clone(), stdout(), quit_token.clone());
 
     // start write to socket thread
-    let writer_handle = async move {
-        let history = MemHistory::new();
-        let mut builder = Config::builder();
-        builder = builder.check_cursor_position(false);
-        let config = builder.build();
-
-        let rl = Arc::new(Mutex::new(
-            Editor::<(), MemHistory>::with_history(config, history).unwrap(),
-        ));
-        loop {
-            if handle.raw_mode {
-                let out = stdout();
-                let raw_stdout = out.into_raw_mode().unwrap();
-
-                let cancel_fut = quit_token_write.cancelled();
-                let input_future = input::handle_key_input();
-                select! {
-                    Ok(Some((key, key_bytes))) = input_future =>{
-                        if key == Key::Ctrl('b'){
-                            raw_stdout.suspend_raw_mode().unwrap();
-                            quit_token_write.cancel();
-                            return
-                        }
-                        write_soc.write_all(&key_bytes).await.unwrap();
-                        write_soc.flush().await.unwrap();
-                    }
-                    _ = cancel_fut =>{
-                        break;
-                    }
-                };
-            } else {
-                let cancel_fut = quit_token_write.cancelled();
-                let input_future = input::read_line(rl.clone(), None);
-                select! {
-                    res = input_future =>{
-                        if res.is_err(){
-                            println!("receiving input failed");
-                            quit_token_write.cancel();
-                            break;
-                        }
-                        let inp_string = res.unwrap();
-                        if inp_string.trim_end() == "back"{
-                            quit_token_write.cancel();
-                            break;
-                        }
-                        write_soc.write_all(inp_string.as_bytes()).await.unwrap();
-                        write_soc.flush().await.unwrap();
-                    }
-                    _ = cancel_fut =>{
-                        break;
-                    }
-                }
-            }
-        }
-    };
+    let writer_handle = soc_write(handle.clone(), quit_token.clone());
     join!(reader_handle, writer_handle);
 }
 
-async fn delete(
-    key: String,
-    connected_shells: &mut MutexGuard<'_, HashMap<String, connection::Handle>>,
-) {
+async fn delete(key: String, connected_shells: &mut MutexGuard<'_, HashMap<String, Handle>>) {
     let handle = match connected_shells.remove(&key) {
         Some(val) => val,
         None => {
@@ -170,7 +160,7 @@ async fn delete(
 fn alias(
     shell_key: String,
     selected_index: u16,
-    connected_shells: &mut MutexGuard<HashMap<String, connection::Handle>>,
+    connected_shells: &mut MutexGuard<HashMap<String, Handle>>,
 ) {
     let mut stdout = stdout();
     macro_rules! reset_alias_line {
@@ -275,7 +265,7 @@ fn list_menu_help(stdout: &mut RawTerminal<Stdout>) {
 fn refresh_list_display(
     stdout: &mut RawTerminal<Stdout>,
     cur_idx: usize,
-    keys: Vec<(String, connection::Handle)>,
+    keys: Vec<(String, Handle)>,
 ) {
     write!(
         stdout,
@@ -321,18 +311,18 @@ fn refresh_list_display(
 pub fn new() -> MenuList {
     let mut menu: MenuList = HashMap::new();
 
-    let list = |connected_shells: Arc<Mutex<HashMap<String, connection::Handle>>>| -> Option<JoinHandle<()>> {
+    let list = |connected_shells: Arc<Mutex<HashMap<String, Handle>>>| -> Option<JoinHandle<()>> {
         Some(tokio::spawn(async move {
             let stdin = stdin();
             let mut stdout = stdout().into_raw_mode().unwrap();
-            let mut shell_list: Vec<(String, connection::Handle)>;
+            let mut shell_list: Vec<(String, Handle)>;
             {
                 shell_list = connected_shells
                     .lock()
                     .await
                     .iter()
                     .map(|item| (item.0.to_owned(), item.1.to_owned()))
-                    .collect::<Vec<(String, connection::Handle)>>()
+                    .collect::<Vec<(String, Handle)>>()
             }
             if shell_list.len() > 0 {
                 let (_, start_pos) = stdout.cursor_pos().unwrap();
@@ -364,7 +354,7 @@ pub fn new() -> MenuList {
                             Key::Char('\n') | Key::Char('\r') => {
                                 let key = keys[cur_idx].to_owned();
                                 let handle_opt = shells.get(&key);
-                                if handle_opt.is_some(){
+                                if handle_opt.is_some() {
                                     let handle = handle_opt.unwrap().clone();
                                     println!(
                                         "\r\n{show}{blink}{clear}",
@@ -452,4 +442,55 @@ pub fn new() -> MenuList {
     );
 
     return menu;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        time::sleep,
+    };
+
+    use crate::socket::connection::handle_new_shell;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_soc() {
+        let listener_res = TcpListener::bind("127.0.0.1:32425").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        let init_handle = tokio::spawn(async move {
+            let (soc, _) = listener.accept().await.unwrap();
+            let connected_shells = Arc::new(Mutex::new(HashMap::<String, Handle>::new()));
+            handle_new_shell(soc, connected_shells.clone(), Some(true)).await;
+            assert!(connected_shells.lock().await.len() > 0);
+            let cancel_token = CancellationToken::new();
+            let cancel_token_copy = cancel_token.clone();
+
+            let mut buf: Vec<u8> = Vec::new();
+            let handle = connected_shells
+                .lock()
+                .await
+                .iter()
+                .next()
+                .unwrap()
+                .1
+                .to_owned();
+            let handle_copy = handle.clone();
+            let write_handle = tokio::spawn(async move {
+                let mut write_half = handle.write_stream.lock().await;
+                write_half.write("hello\n".as_bytes()).await.unwrap();
+                write_half.flush().await.unwrap();
+                sleep(Duration::from_millis(500)).await;
+                cancel_token_copy.cancel();
+            });
+            soc_read(handle_copy, &mut buf, cancel_token).await;
+            write_handle.await.unwrap();
+        });
+        TcpStream::connect("127.0.0.1:32425").await.unwrap();
+        init_handle.await.unwrap();
+    }
 }
