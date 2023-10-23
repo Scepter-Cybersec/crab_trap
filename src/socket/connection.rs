@@ -1,264 +1,138 @@
-use std::io::{stdin, Write};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::listener;
-use rustyline::error::ReadlineError;
-use rustyline::history::FileHistory;
+use rustyline::history::MemHistory;
 use rustyline::{Config, Editor};
-use termion::clear;
-use termion::event::{Event, Key};
-use termion::input::TermReadEventsAndRaw;
-use termion::raw::RawTerminal;
-use tokio::select;
-use tokio::sync::broadcast::{self, Sender as HandleSender};
-use tokio::sync::mpsc::{self, Sender};
-use tokio::sync::watch::{self, Receiver};
+use sha256::digest;
+use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::task;
-use tokio_util::sync::CancellationToken;
+use tokio::time::sleep;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Handle {
-    pub rl: Arc<Mutex<Editor<(), FileHistory>>>,
-    pub tx: HandleSender<&'static str>,
-    pub soc_kill_token: CancellationToken,
+    pub readline: Arc<Mutex<Editor<(), MemHistory>>>,
+    pub read_stream: Arc<Mutex<OwnedReadHalf>>,
+    pub write_stream: Arc<Mutex<OwnedWriteHalf>>,
     pub raw_mode: bool,
 }
 
-async fn handle_key_input() -> Option<(Key, Vec<u8>)> {
-    let (tx, mut rx) = mpsc::channel(1024);
-    // stdin().keys() blocks the main thread so we have to spawn a new one and run it there
-    task::spawn(async move {
-        let key_input = stdin().events_and_raw().next();
-        tx.send(key_input).await.unwrap();
-    });
-    let key_res = rx.recv().await.unwrap();
-    return match key_res {
-        Some(key) => {
-            return match key {
-                Ok((Event::Key(k), raw)) => Some((k, raw)),
-                Err(_) => None,
-                _ => None,
-            };
-        }
-        None => None,
-    };
-}
-
-pub async fn read_line(
-    rl: Arc<Mutex<Editor<(), FileHistory>>>,
-    prompt: Option<&str>,
-) -> Result<String, ReadlineError> {
-    let (tx, mut rx) = mpsc::channel::<Result<String, ReadlineError>>(1024);
-    let input_prompt = match prompt {
-        Some(val) => String::from(val),
-        None => String::from(""),
-    };
-    task::spawn(async move {
-        let mut reader = rl.lock().await;
-
-        let raw_content = reader.readline(&input_prompt);
-
-        let content = match raw_content {
-            Ok(line) => {
-                reader.add_history_entry(line.clone()).unwrap_or_default();
-                Ok(line + "\n")
-            }
-            Err(e) => Err(e),
-        };
-        tx.send(content).await.unwrap_or_default();
-    });
-    let received_content = rx.recv().await.unwrap()?;
-    return Ok(received_content);
-}
-
 impl Handle {
-    pub fn new() -> (Handle, CancellationToken) {
-        let (tx, _) = broadcast::channel::<&str>(1024);
-        let soc_kill_token = CancellationToken::new();
-        let soc_kill_token_listen = soc_kill_token.clone();
+    pub fn new(read_stream: OwnedReadHalf, write_stream: OwnedWriteHalf) -> Handle {
+        let history = MemHistory::new();
         let mut builder = Config::builder();
         builder = builder.check_cursor_position(false);
         let config = builder.build();
-        let rl = Arc::new(Mutex::new(
-            Editor::<(), FileHistory>::with_config(config).unwrap(),
-        ));
         let handle = Handle {
-            rl,
-            tx,
-            soc_kill_token,
+            readline: Arc::new(Mutex::new(Editor::with_history(config, history).unwrap())),
+            read_stream: Arc::new(Mutex::new(read_stream)),
+            write_stream: Arc::new(Mutex::new(write_stream)),
             raw_mode: false,
         };
-        return (handle, soc_kill_token_listen);
+        return handle;
     }
+}
 
-    pub fn handle_listen<W>(
-        &self,
-        handle_to_soc_send: Sender<String>,
-        mut soc_to_handle_recv: Receiver<String>,
-        mut stdout: RawTerminal<W>,
-    ) where
-        W: Write + Send + 'static,
-    {
-        let tx = self.tx.clone();
-        let rl = self.rl.clone();
-        let tx_copy = self.tx.clone();
-        let mut raw_mode = self.raw_mode;
-        let (prompt_tx, mut prompt_rx) = watch::channel(String::from(""));
-        let (raw_mode_tx, mut raw_mode_rx) = mpsc::channel::<bool>(1024);
-        // start reader
-        tokio::spawn(async move {
-            let mut active = false;
-
-            loop {
-                if !active {
-                    if listener::wait_for_signal(tx_copy.subscribe(), "start", Some(&mut raw_mode))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    active = true;
-                }
-                // wait for new read content or pause notification
-                select! {
-                    _ = soc_to_handle_recv.changed() =>{
-                        let resp = soc_to_handle_recv.borrow().to_owned();
-                        let outp =match raw_mode{
-                            true =>resp,
-                            false => format!("{clear}\r{resp}", clear = clear::CurrentLine)
-                        };
-                        stdout.write_all(outp.as_bytes()).unwrap();
-                        stdout.flush().unwrap();
-                        let new_prompt = match outp.split("\n").last(){
-                            Some(s)=>s,
-                            None => ""
-                        };
-                        if prompt_tx.send(String::from(new_prompt)).err().is_some() {
-                            continue;
-                        }
-                    }
-                    _ = listener::wait_for_signal(tx_copy.subscribe(), "quit", Some(&mut raw_mode)) =>{
-                        stdout.suspend_raw_mode().unwrap();
-                        active = false;
-                    }
-                    raw_term_state = raw_mode_rx.recv() =>{
-                        if raw_term_state.is_none(){
-                            println!("Terminal closed");
-                            continue;
-                        }
-                        match raw_term_state.unwrap(){
-                            true => stdout.activate_raw_mode().unwrap_or_default(),
-                            false => stdout.suspend_raw_mode().unwrap_or_default()
-                        };
-                    }
-                }
+pub async fn soc_is_shell(
+    read_stream: Arc<Mutex<OwnedReadHalf>>,
+    write_stream: Arc<Mutex<OwnedWriteHalf>>,
+    soc_key: String,
+) -> bool {
+    let read_soc = read_stream.lock().await;
+    let mut write_soc = write_stream.lock().await;
+    write_soc
+        .write(format!("echo {}\r\n", soc_key).as_bytes())
+        .await
+        .unwrap();
+    let mut buf: [u8; 4096] = [0; 4096];
+    for _ in 0..10 {
+        let len = read_soc.try_read(&mut buf);
+        if len.is_ok() {
+            let content: String = String::from_utf8_lossy(&buf[..len.unwrap()]).into();
+            if content.contains(&soc_key) {
+                // add a new line so we get our prompt back, also check to make sure the socket did not just close
+                write_soc.write("\n".as_bytes()).await.unwrap_or_default();
+                return true;
             }
-        });
-        // start writer
-        tokio::spawn(async move {
-            // wait for start signal
-            if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
-                .await
-                .is_err()
-            {
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    return false;
+}
+
+pub async fn handle_new_shell(
+    soc: TcpStream,
+    connected_shells: Arc<Mutex<HashMap<String, Handle>>>,
+    skip_validation: Option<bool>,
+) {
+    let soc_addr = soc.peer_addr();
+    let (soc_read, soc_write) = soc.into_split();
+    let handle = Handle::new(soc_read, soc_write);
+
+    let soc_key: String;
+    match soc_addr {
+        Ok(val) => {
+            soc_key = digest(val.to_string())[0..31].to_string();
+            let is_shell = match skip_validation {
+                Some(true) => true,
+                _ => {
+                    soc_is_shell(
+                        handle.read_stream.clone(),
+                        handle.write_stream.clone(),
+                        soc_key.clone(),
+                    )
+                    .await
+                }
+            };
+            if is_shell {
+                let mut shells = connected_shells.lock().await;
+                shells.insert(soc_key, handle);
+            } else {
                 return;
             }
-            loop {
-                if !raw_mode {
-                    raw_mode_tx.send(false).await.unwrap();
-                    let new_prompt = prompt_rx.borrow_and_update().to_owned();
-                    let mut content = match read_line(rl.clone(), Some(new_prompt.as_str())).await {
-                        Ok(val) => val,
-                        Err(_) => continue,
-                    };
-
-                    if content.trim_end().eq("back") {
-                        println!("{clear}", clear = clear::BeforeCursor);
-                        //notify the reader that we're pausing
-                        tx.send("quit").unwrap();
-                        // send a new line so we get a prompt when we return
-                        content = String::from("\n");
-                        if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    if handle_to_soc_send.send(content).await.is_err() {
-                        return;
-                    }
-                } else {
-                    raw_mode_tx.send(true).await.unwrap();
-                    let input_opt = handle_key_input().await;
-                    if input_opt.is_none() {
-                        continue;
-                    }
-
-                    let (key_val, key_bytes) = input_opt.unwrap();
-                    if key_val == Key::Ctrl('b') {
-                        println!("{clear}", clear = clear::BeforeCursor);
-                        tx.send("quit").unwrap();
-                        raw_mode_tx.send(false).await.unwrap();
-                        if listener::wait_for_signal(tx.subscribe(), "start", Some(&mut raw_mode))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if !raw_mode {
-                            continue;
-                        }
-                        raw_mode_tx.send(true).await.unwrap();
-                        handle_to_soc_send.send(String::from("\n")).await.unwrap()
-                    }
-                    handle_to_soc_send
-                        .send(String::from_utf8_lossy(&key_bytes).into_owned())
-                        .await
-                        .unwrap();
-                }
-            }
-        });
+        }
+        Err(_) => return,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use termion::raw::IntoRawMode;
-    use tokio::{
-        io::AsyncWriteExt,
-        net::{TcpListener, TcpStream},
-    };
+mod test {
+    use tokio::net::TcpListener;
 
     use super::*;
 
     #[tokio::test]
-    async fn test_handle() {
-        let listener_res = TcpListener::bind("127.0.0.1:32426").await;
+    async fn test_soc_is_shell() {
+        let listener_res = TcpListener::bind("127.0.0.1:32423").await;
         assert!(listener_res.is_ok());
         let listener = listener_res.unwrap();
         tokio::spawn(async move {
-            let (mut tcp_stream, _) = listener.accept().await.unwrap();
-            //mock return vale from soc
-            tcp_stream.write("mock value".as_bytes()).await.unwrap();
+            let (mut soc, _) = listener.accept().await.unwrap();
+            soc.write("test123\n".as_bytes()).await.unwrap();
         });
-        let stream = TcpStream::connect("127.0.0.1:32426").await.unwrap();
-        let (handle, cancel_token) = Handle::new();
-        let (handle_to_soc_send, handle_to_soc_recv) = mpsc::channel::<String>(1024);
-        let (soc_to_handle_send, soc_to_handle_recv) = watch::channel::<String>(String::from(""));
-        let out = std::io::Cursor::new(Vec::new()).into_raw_mode().unwrap();
-        listener::start_socket(stream, soc_to_handle_send, handle_to_soc_recv, cancel_token);
-        handle.handle_listen(handle_to_soc_send.clone(), soc_to_handle_recv.clone(), out);
-        let mut rx = handle.tx.subscribe();
+        let (read, write) = TcpStream::connect("127.0.0.1:32423")
+            .await
+            .unwrap()
+            .into_split();
+        let read_half = Arc::new(Mutex::new(read));
+        let write_half = Arc::new(Mutex::new(write));
+        assert!(soc_is_shell(read_half, write_half, String::from("test123")).await);
+    }
 
-        //test handle channel send/receive
-        tokio::spawn(async move {
-            assert_eq!(rx.recv().await.unwrap(), "start");
+    #[tokio::test]
+    async fn test_handle_new_shell() {
+        let listener_res = TcpListener::bind("127.0.0.1:32424").await;
+        assert!(listener_res.is_ok());
+        let listener = listener_res.unwrap();
+        let handle_init = tokio::spawn(async move {
+            let (soc, _) = listener.accept().await.unwrap();
+            let connected_shells = Arc::new(Mutex::new(HashMap::<String, Handle>::new()));
+            handle_new_shell(soc, connected_shells.clone(), Some(true)).await;
+            assert!(connected_shells.lock().await.len() > 0);
         });
-        handle.tx.send("start").unwrap();
-
-        soc_to_handle_recv.clone().changed().await.unwrap();
-        assert_eq!("mock value", soc_to_handle_recv.borrow().as_str());
+        TcpStream::connect("127.0.0.1:32424").await.unwrap();
+        handle_init.await.unwrap();
     }
 }

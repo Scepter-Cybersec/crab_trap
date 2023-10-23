@@ -13,6 +13,5 @@ other cool features:
 This project is still under active development, PRs are welcome 
 
 ## TODO:
-- Add testing
 - Add support for multiple running instances (maybe a client/server architecture)
 - Notifications when new shell is caught
