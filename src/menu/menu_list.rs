@@ -139,7 +139,34 @@ async fn start(handle: Handle) {
         }
     }
 
-    let reader_handle = soc_read(handle.clone(), stdout(), quit_token.clone());
+    {
+        if handle.raw_mode {
+            let size = termion::terminal_size();
+            if size.is_ok() {
+                let (cols, rows) = size.unwrap();
+                let mut write_soc = handle.write_stream.lock().await;
+                write_soc
+                    .write_all(format!("\nstty rows {rows} cols {cols}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write_soc.flush().await.unwrap();
+            }
+        }
+    }
+
+    let out_writer: Box<dyn Write + Send> = match handle.raw_mode {
+        true => {
+            let tty_res = termion::get_tty();
+            let mut out: Box<dyn Write + Send> = Box::new(stdout());
+            if tty_res.is_ok() {
+                out = Box::new(tty_res.unwrap());
+            }
+            out
+        }
+        false => Box::new(stdout()),
+    };
+
+    let reader_handle = soc_read(handle.clone(), out_writer, quit_token.clone());
 
     // start write to socket thread
     let writer_handle = soc_write(handle.clone(), quit_token.clone());

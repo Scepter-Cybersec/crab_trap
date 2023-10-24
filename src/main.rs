@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use menu::menu_list::clear;
 use rustyline::DefaultEditor;
-use std::process::Command;
+use std::process::{Command, exit};
 use termion::raw::IntoRawMode;
 
 use crate::menu::menu_list;
@@ -137,11 +137,17 @@ async fn main() {
         reset = color::Fg(color::Reset)
     );
     input_loop(connected_shells.clone(), menu, Some(init_message));
-    let socket_stream = listener::catch_sockets(bound_addr, bound_port);
+    let socket_stream = listener::catch_sockets(bound_addr.clone(), bound_port);
     pin_mut!(socket_stream);
 
     loop {
-        let soc = socket_stream.next().await.unwrap().unwrap();
+        let soc = match socket_stream.next().await.unwrap() {
+            Ok(val)=>val,
+            Err(_) => {
+                eprintln!("\nError address already in use {bound_addr}:{bound_port}");
+                exit(1)
+            }
+        };
         handle_new_shell(soc, connected_shells.clone(), None).await;
     }
 }
