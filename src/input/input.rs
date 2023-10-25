@@ -80,14 +80,14 @@ pub fn display_notification(text: String) {
     );
 
     // save cursor position
-    write!(stdout, "{}", cursor::Save).unwrap();
+    stdout.write_all(&"\x1B7".as_bytes()).unwrap();
     stdout.flush().unwrap();
 
     stdout.write_all(&notification.as_bytes()).unwrap();
     stdout.flush().unwrap();
 
     // restore cursor position
-    write!(stdout, "{}", cursor::Restore).unwrap();
+    stdout.write_all(&"\x1B8".as_bytes()).unwrap();
     stdout.flush().unwrap();
 }
 
