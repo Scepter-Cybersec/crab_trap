@@ -2,19 +2,21 @@ use std::collections::HashMap;
 use std::env::{self, set_current_dir};
 use std::sync::Arc;
 
-use input::input::read_line;
+use input::input::{read_line, CompletionHelper};
 use menu::menu_list::clear;
-use rustyline::DefaultEditor;
+use rustyline::history::MemHistory;
+use rustyline::{Config, CompletionType, Editor};
 use std::process::{exit, Command};
 use termion::raw::IntoRawMode;
 
+use crate::input::input::display_notification;
 use crate::menu::menu_list;
 use crate::socket::{connection, listener};
 use connection::{handle_new_shell, Handle};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use std::io::{stdout, Write};
-use termion::{self, clear, color, cursor};
+use std::io::stdout;
+use termion::{self, color};
 use tokio::sync::Mutex;
 
 mod input;
@@ -45,7 +47,14 @@ fn input_loop(
     init_message: Option<String>,
 ) {
     tokio::spawn(async move {
-        let menu_rl = Arc::new(Mutex::new(DefaultEditor::new().unwrap()));
+        let history = MemHistory::new();
+        let mut builder = Config::builder();
+        builder = builder.completion_type(CompletionType::Circular);
+        let config = builder.build();
+        let mut rl = Editor::with_history(config, history).unwrap();
+        let helper = CompletionHelper::new();
+        rl.set_helper(Some(helper));
+        let menu_rl = Arc::new(Mutex::new(rl));
         clear();
         if init_message.is_some() {
             let msg = init_message.unwrap();
@@ -144,37 +153,12 @@ async fn main() {
                 exit(1)
             }
         };
-        // display notification, I know this is gross but it's the best I can do with rustyline getting in the way :(
-        let mut stdout = stdout();
-        let notification = format!(
-            "{goto}{clear}{success}new shell received from {addr} !{reset}",
-            goto = cursor::Goto(1, 1),
-            clear = clear::CurrentLine,
-            success = color::Fg(color::LightGreen),
-            addr = soc.peer_addr().unwrap().to_string(),
-            reset = color::Fg(color::Reset),
-        );
-        // save cursor position
-        stdout
-            .write_all(&"\x1B7".as_bytes())
-            .unwrap();
-        stdout.flush().unwrap();
 
-        stdout
-            .write_all(
-                &notification
-                .as_bytes(),
-            )
-            .unwrap();
-        stdout.flush().unwrap();
+        let soc_added = handle_new_shell(soc, connected_shells.clone(), None).await;
 
-        // restore cursor position
-        stdout
-            .write_all(&"\x1B8".as_bytes())
-            .unwrap();
-        stdout.flush().unwrap();
-
-        handle_new_shell(soc, connected_shells.clone(), None).await;
+        if soc_added {
+            display_notification(String::from("new shell received!"));
+        }
     }
 }
 

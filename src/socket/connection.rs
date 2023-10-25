@@ -11,9 +11,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::input::input::CompletionHelper;
+
 #[derive(Clone)]
 pub struct Handle {
-    pub readline: Arc<Mutex<Editor<(), MemHistory>>>,
+    pub readline: Arc<Mutex<Editor<CompletionHelper, MemHistory>>>,
     pub read_stream: Arc<Mutex<OwnedReadHalf>>,
     pub write_stream: Arc<Mutex<OwnedWriteHalf>>,
     pub raw_mode: bool,
@@ -25,8 +27,10 @@ impl Handle {
         let mut builder = Config::builder();
         builder = builder.check_cursor_position(false);
         let config = builder.build();
+        let mut rl = Editor::with_history(config, history).unwrap();
+        rl.set_helper(Some(CompletionHelper::new_only_hinter()));
         let handle = Handle {
-            readline: Arc::new(Mutex::new(Editor::with_history(config, history).unwrap())),
+            readline: Arc::new(Mutex::new(rl)),
             read_stream: Arc::new(Mutex::new(read_stream)),
             write_stream: Arc::new(Mutex::new(write_stream)),
             raw_mode: false,
@@ -66,7 +70,7 @@ pub async fn handle_new_shell(
     soc: TcpStream,
     connected_shells: Arc<Mutex<HashMap<String, Handle>>>,
     skip_validation: Option<bool>,
-) {
+) -> bool {
     let soc_addr = soc.peer_addr();
     let (soc_read, soc_write) = soc.into_split();
     let handle = Handle::new(soc_read, soc_write);
@@ -90,11 +94,12 @@ pub async fn handle_new_shell(
                 let mut shells = connected_shells.lock().await;
                 shells.insert(soc_key, handle);
             } else {
-                return;
+                return false;
             }
         }
-        Err(_) => return,
+        Err(_) => return false,
     }
+    return true;
 }
 
 #[cfg(test)]
