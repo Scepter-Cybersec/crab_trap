@@ -5,7 +5,7 @@ use std::sync::Arc;
 use input::input::{read_line, CompletionHelper};
 use menu::menu_list::clear;
 use rustyline::history::MemHistory;
-use rustyline::{Config, CompletionType, Editor};
+use rustyline::{CompletionType, Config, Editor};
 use std::process::{exit, Command};
 use termion::raw::IntoRawMode;
 
@@ -157,7 +157,14 @@ async fn main() {
         let soc_added = handle_new_shell(soc, connected_shells.clone(), None).await;
 
         if soc_added {
-            display_notification(String::from("new shell received!"));
+            let num_shells = connected_shells.lock().await.len();
+            display_notification(format!(
+                "{num_shells} shell{plural} in trap!",
+                plural = match num_shells {
+                    1 => "",
+                    _ => "s",
+                }
+            ));
         }
     }
 }
