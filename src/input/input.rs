@@ -72,11 +72,13 @@ impl CompletionHelper {
 pub fn display_notification(text: String) {
     let mut stdout = stdout();
     let notification = format!(
-        "{goto}{clear}{success}{text}{reset}",
+        "{goto}{clear}{success_bg}{success}{text}{reset}{reset_bg}",
         goto = cursor::Goto(1, 1),
         clear = clear::CurrentLine,
-        success = color::Fg(color::LightGreen),
+        success = color::Fg(color::Red),
+        success_bg = color::Bg(color::Rgb(255, 200, 0)),
         reset = color::Fg(color::Reset),
+        reset_bg = color::Bg(color::Reset),
     );
 
     // save cursor position
