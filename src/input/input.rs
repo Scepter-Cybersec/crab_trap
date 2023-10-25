@@ -1,10 +1,18 @@
-use std::{io::stdin, sync::Arc};
+use std::{
+    io::{stdin, stdout, Write},
+    sync::Arc,
+};
 
 use rustyline::{
+    completion::{Completer, FilenameCompleter, Pair},
+    highlight::Highlighter,
+    hint::{Hinter, HistoryHinter},
     history::History,
-    Editor,
+    validate::Validator,
+    Editor, Helper,
 };
 use termion::{
+    clear, color, cursor,
     event::{Event, Key},
     input::TermReadEventsAndRaw,
 };
@@ -16,12 +24,80 @@ use tokio::{
     task,
 };
 
-pub async fn read_line<H>(
-    rl: Arc<Mutex<Editor<(), H>>>,
+pub struct CompletionHelper {
+    completer: Option<FilenameCompleter>,
+    hinter: HistoryHinter,
+}
+impl Helper for CompletionHelper {}
+impl Hinter for CompletionHelper {
+    type Hint = String;
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+        return self.hinter.hint(line, pos, ctx);
+    }
+}
+impl Highlighter for CompletionHelper {}
+impl Validator for CompletionHelper {}
+impl Completer for CompletionHelper {
+    type Candidate = Pair;
+    fn complete(
+        &self, // FIXME should be `&mut self`
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        return match &self.completer {
+            Some(completer) => completer.complete(line, pos, ctx),
+            None => Ok((0, Vec::new())),
+        };
+    }
+}
+
+impl CompletionHelper {
+    pub fn new() -> CompletionHelper {
+        let helper: CompletionHelper = CompletionHelper {
+            completer: Some(FilenameCompleter::new()),
+            hinter: HistoryHinter {},
+        };
+        return helper;
+    }
+    pub fn new_only_hinter() -> CompletionHelper {
+        let helper: CompletionHelper = CompletionHelper {
+            completer: None,
+            hinter: HistoryHinter {},
+        };
+        return helper;
+    }
+}
+
+pub fn display_notification(text: String) {
+    let mut stdout = stdout();
+    let notification = format!(
+        "{goto}{clear}{success}{text}{reset}",
+        goto = cursor::Goto(1, 1),
+        clear = clear::CurrentLine,
+        success = color::Fg(color::LightGreen),
+        reset = color::Fg(color::Reset),
+    );
+
+    // save cursor position
+    write!(stdout, "{}", cursor::Save).unwrap();
+    stdout.flush().unwrap();
+
+    stdout.write_all(&notification.as_bytes()).unwrap();
+    stdout.flush().unwrap();
+
+    // restore cursor position
+    write!(stdout, "{}", cursor::Restore).unwrap();
+    stdout.flush().unwrap();
+}
+
+pub async fn read_line<T, H>(
+    rl: Arc<Mutex<Editor<T, H>>>,
     prompt: Option<&str>,
 ) -> Result<String, RecvError>
 where
     H: History + Send + 'static,
+    T: Helper + Send + 'static,
 {
     let (tx, rx) = oneshot::channel::<String>();
     let input_prompt = match prompt {
