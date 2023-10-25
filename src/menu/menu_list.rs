@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
 
-use crate::input::input;
+use crate::input::input::{self, read_line};
 use crate::socket::connection;
 
 pub type MenuListValue = Box<
@@ -91,7 +91,7 @@ async fn soc_write(handle: Handle, cancel_token: CancellationToken) {
             };
         } else {
             let cancel_fut = cancel_token.cancelled();
-            let input_future = input::read_line(handle.readline.clone(), None);
+            let input_future = read_line(handle.readline.clone(), None);
             select! {
                 res = input_future =>{
                     if res.is_err(){

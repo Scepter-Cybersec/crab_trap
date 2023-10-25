@@ -2,19 +2,20 @@ use std::collections::HashMap;
 use std::env::{self, set_current_dir};
 use std::sync::Arc;
 
+use input::input::read_line;
 use menu::menu_list::clear;
 use rustyline::DefaultEditor;
-use std::process::{Command, exit};
+use std::process::{exit, Command};
 use termion::raw::IntoRawMode;
 
 use crate::menu::menu_list;
 use crate::socket::{connection, listener};
+use connection::{handle_new_shell, Handle};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use std::io::stdout;
-use termion::{self, color};
+use std::io::{stdout, Write};
+use termion::{self, clear, color, cursor};
 use tokio::sync::Mutex;
-use connection::{Handle, handle_new_shell};
 
 mod input;
 mod menu;
@@ -44,7 +45,7 @@ fn input_loop(
     init_message: Option<String>,
 ) {
     tokio::spawn(async move {
-        let mut menu_rl = DefaultEditor::new().unwrap();
+        let menu_rl = Arc::new(Mutex::new(DefaultEditor::new().unwrap()));
         clear();
         if init_message.is_some() {
             let msg = init_message.unwrap();
@@ -56,11 +57,8 @@ fn input_loop(
             let stdout = stdout().into_raw_mode().unwrap();
             stdout.suspend_raw_mode().unwrap();
             let (prompt, home) = get_prompt();
-            let content = match menu_rl.readline(prompt.as_str()) {
-                Ok(line) => {
-                    menu_rl.add_history_entry(line.as_str()).unwrap_or_default();
-                    line
-                }
+            let content = match read_line(menu_rl.clone(), Some(&prompt)).await {
+                Ok(line) => line,
                 Err(_) => continue,
             };
 
@@ -125,9 +123,7 @@ async fn main() {
         println!("Usage: {0} OR {0} <address> <port>", args[0]);
         return;
     }
-    let connected_shells = Arc::new(Mutex::new(
-        HashMap::<String, Handle>::new(),
-    ));
+    let connected_shells = Arc::new(Mutex::new(HashMap::<String, Handle>::new()));
     let menu = menu_list::new();
 
     // get user input
@@ -142,12 +138,42 @@ async fn main() {
 
     loop {
         let soc = match socket_stream.next().await.unwrap() {
-            Ok(val)=>val,
+            Ok(val) => val,
             Err(_) => {
                 eprintln!("\nError address already in use {bound_addr}:{bound_port}");
                 exit(1)
             }
         };
+        // display notification, I know this is gross but it's the best I can do with rustyline getting in the way :(
+        let mut stdout = stdout();
+        let notification = format!(
+            "{goto}{clear}{success}new shell received from {addr} !{reset}",
+            goto = cursor::Goto(1, 1),
+            clear = clear::CurrentLine,
+            success = color::Fg(color::LightGreen),
+            addr = soc.peer_addr().unwrap().to_string(),
+            reset = color::Fg(color::Reset),
+        );
+        // save cursor position
+        stdout
+            .write_all(&"\x1B7".as_bytes())
+            .unwrap();
+        stdout.flush().unwrap();
+
+        stdout
+            .write_all(
+                &notification
+                .as_bytes(),
+            )
+            .unwrap();
+        stdout.flush().unwrap();
+
+        // restore cursor position
+        stdout
+            .write_all(&"\x1B8".as_bytes())
+            .unwrap();
+        stdout.flush().unwrap();
+
         handle_new_shell(soc, connected_shells.clone(), None).await;
     }
 }
@@ -163,5 +189,4 @@ mod tests {
             .starts_with(format!("{red}crab_trap 🦀:", red = color::Fg(color::LightRed)).as_str()));
         assert_ne!(home, "");
     }
-
 }

@@ -1,6 +1,9 @@
 use std::{io::stdin, sync::Arc};
 
-use rustyline::{history::MemHistory, Editor};
+use rustyline::{
+    history::History,
+    Editor,
+};
 use termion::{
     event::{Event, Key},
     input::TermReadEventsAndRaw,
@@ -13,10 +16,13 @@ use tokio::{
     task,
 };
 
-pub async fn read_line(
-    rl: Arc<Mutex<Editor<(), MemHistory>>>,
+pub async fn read_line<H>(
+    rl: Arc<Mutex<Editor<(), H>>>,
     prompt: Option<&str>,
-) -> Result<String, RecvError> {
+) -> Result<String, RecvError>
+where
+    H: History + Send + 'static,
+{
     let (tx, rx) = oneshot::channel::<String>();
     let input_prompt = match prompt {
         Some(s) => String::from(s),
