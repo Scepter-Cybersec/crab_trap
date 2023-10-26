@@ -6,11 +6,12 @@ use std::{
 use rustyline::{
     completion::{Completer, FilenameCompleter, Pair},
     highlight::Highlighter,
-    hint::{Hinter, HistoryHinter},
+    hint::HistoryHinter,
     history::History,
-    validate::Validator,
+    validate::MatchingBracketValidator,
     Editor, Helper,
 };
+use rustyline_derive::{Helper, Hinter, Validator};
 use termion::{
     clear, color, cursor,
     event::{Event, Key},
@@ -24,20 +25,27 @@ use tokio::{
     task,
 };
 
-pub struct CompletionHelper {
+#[derive(Helper, Hinter, Validator)]
+pub struct InputHelper {
     completer: Option<FilenameCompleter>,
+    #[rustyline(Validator)]
+    validator: MatchingBracketValidator,
+    #[rustyline(Hinter)]
     hinter: HistoryHinter,
 }
-impl Helper for CompletionHelper {}
-impl Hinter for CompletionHelper {
-    type Hint = String;
-    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
-        return self.hinter.hint(line, pos, ctx);
+
+impl Highlighter for InputHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        return format!(
+            "{grey}{hint}{reset}",
+            grey = color::Fg(color::Rgb(100, 100, 100)),
+            reset = color::Fg(color::Reset)
+        )
+        .into();
     }
 }
-impl Highlighter for CompletionHelper {}
-impl Validator for CompletionHelper {}
-impl Completer for CompletionHelper {
+
+impl Completer for InputHelper {
     type Candidate = Pair;
     fn complete(
         &self, // FIXME should be `&mut self`
@@ -52,18 +60,20 @@ impl Completer for CompletionHelper {
     }
 }
 
-impl CompletionHelper {
-    pub fn new() -> CompletionHelper {
-        let helper: CompletionHelper = CompletionHelper {
+impl InputHelper {
+    pub fn new() -> InputHelper {
+        let helper: InputHelper = InputHelper {
             completer: Some(FilenameCompleter::new()),
             hinter: HistoryHinter {},
+            validator: MatchingBracketValidator::new(),
         };
         return helper;
     }
-    pub fn new_only_hinter() -> CompletionHelper {
-        let helper: CompletionHelper = CompletionHelper {
+    pub fn new_only_hinter() -> InputHelper {
+        let helper: InputHelper = InputHelper {
             completer: None,
             hinter: HistoryHinter {},
+            validator: MatchingBracketValidator::new(),
         };
         return helper;
     }
