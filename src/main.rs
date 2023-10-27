@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env::{self, set_current_dir};
 use std::sync::Arc;
 
-use input::input::{read_line, CompletionHelper};
+use input::input::{read_line, InputHelper};
 use menu::menu_list::clear;
 use rustyline::history::MemHistory;
 use rustyline::{CompletionType, Config, Editor};
@@ -52,7 +52,7 @@ fn input_loop(
         builder = builder.completion_type(CompletionType::Circular);
         let config = builder.build();
         let mut rl = Editor::with_history(config, history).unwrap();
-        let helper = CompletionHelper::new();
+        let helper = InputHelper::new();
         rl.set_helper(Some(helper));
         let menu_rl = Arc::new(Mutex::new(rl));
         clear();

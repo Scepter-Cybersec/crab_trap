@@ -11,11 +11,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-use crate::input::input::CompletionHelper;
+use crate::input::input::InputHelper;
 
 #[derive(Clone)]
 pub struct Handle {
-    pub readline: Arc<Mutex<Editor<CompletionHelper, MemHistory>>>,
+    pub readline: Arc<Mutex<Editor<InputHelper, MemHistory>>>,
     pub read_stream: Arc<Mutex<OwnedReadHalf>>,
     pub write_stream: Arc<Mutex<OwnedWriteHalf>>,
     pub raw_mode: bool,
@@ -28,7 +28,7 @@ impl Handle {
         builder = builder.check_cursor_position(false);
         let config = builder.build();
         let mut rl = Editor::with_history(config, history).unwrap();
-        rl.set_helper(Some(CompletionHelper::new_only_hinter()));
+        rl.set_helper(Some(InputHelper::new_only_hinter()));
         let handle = Handle {
             readline: Arc::new(Mutex::new(rl)),
             read_stream: Arc::new(Mutex::new(read_stream)),

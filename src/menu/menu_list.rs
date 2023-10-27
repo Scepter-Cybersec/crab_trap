@@ -10,6 +10,7 @@ use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::{clear, color, cursor, terminal_size};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio::{join, select};
@@ -39,8 +40,12 @@ pub fn exit() {
     std::process::exit(0);
 }
 
-async fn soc_read<W>(handle: Handle, mut out_writer: W, cancel_token: CancellationToken)
-where
+async fn soc_read<W>(
+    handle: Handle,
+    mut out_writer: W,
+    cancel_token: CancellationToken,
+    prompt_tx: Sender<String>,
+) where
     W: Write,
 {
     let mut read_soc = handle.read_stream.lock().await;
@@ -56,7 +61,15 @@ where
                     return
                 }
                 let n = bytes_read.unwrap();
-                out_writer.write_all(&mut read_buf[0..n]).unwrap();
+                let content = String::from_utf8_lossy(&read_buf[0..n]);
+                let prompt = content.lines().last().unwrap_or("");
+                prompt_tx.send(String::from(prompt)).unwrap_or_else(|_|{eprintln!("Prompt channel closed!")});
+                let send_content = match handle.raw_mode {
+                    false => String::from("\r")+&format!("{}",clear::CurrentLine)+&String::from_utf8_lossy(&read_buf[0..n]).into_owned(),
+                    true => content.into_owned()
+                };
+
+                out_writer.write_all(send_content.as_bytes()).unwrap();
                 out_writer.flush().unwrap();
             }
             _ = cancel_fut =>{
@@ -66,7 +79,7 @@ where
     }
 }
 
-async fn soc_write(handle: Handle, cancel_token: CancellationToken) {
+async fn soc_write(handle: Handle, cancel_token: CancellationToken, prompt_rx: Receiver<String>) {
     let mut write_soc = handle.write_stream.lock().await;
     loop {
         if handle.raw_mode {
@@ -91,7 +104,8 @@ async fn soc_write(handle: Handle, cancel_token: CancellationToken) {
             };
         } else {
             let cancel_fut = cancel_token.cancelled();
-            let input_future = read_line(handle.readline.clone(), None);
+            let prompt = prompt_rx.borrow().to_string();
+            let input_future = read_line(handle.readline.clone(), Some(prompt.as_str()));
             select! {
                 res = input_future =>{
                     if res.is_err(){
@@ -166,10 +180,11 @@ async fn start(handle: Handle) {
         false => Box::new(stdout()),
     };
 
-    let reader_handle = soc_read(handle.clone(), out_writer, quit_token.clone());
+    let (prompt_tx, prompt_rx) = watch::channel(String::from(""));
+    let reader_handle = soc_read(handle.clone(), out_writer, quit_token.clone(), prompt_tx);
 
     // start write to socket thread
-    let writer_handle = soc_write(handle.clone(), quit_token.clone());
+    let writer_handle = soc_write(handle.clone(), quit_token.clone(), prompt_rx);
     join!(reader_handle, writer_handle);
 }
 
@@ -514,7 +529,8 @@ mod tests {
                 sleep(Duration::from_millis(500)).await;
                 cancel_token_copy.cancel();
             });
-            soc_read(handle_copy, &mut buf, cancel_token).await;
+            let (prompt_tx, _) = watch::channel(String::from(""));
+            soc_read(handle_copy, &mut buf, cancel_token, prompt_tx).await;
             write_handle.await.unwrap();
         });
         TcpStream::connect("127.0.0.1:32425").await.unwrap();

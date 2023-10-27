@@ -142,6 +142,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "rustyline",
+ "rustyline-derive",
  "sha256",
  "termion",
  "tokio",
@@ -563,6 +564,17 @@ dependencies = [
  "unicode-width",
  "utf8parse",
  "winapi",
+]
+
+[[package]]
+name = "rustyline-derive"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a32af5427251d2e4be14fc151eabe18abb4a7aad5efee7044da9f096c906a43"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
